@@ -16,7 +16,7 @@ arxiv_agent.py
 # --- repo-root bootstrap：保证 `python <本文件>` 在任意 cwd 下都能 import 到包 ---
 import sys
 from pathlib import Path
-_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "agent" / "__init__.py").exists())
+_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "ResearcherAgent" / "__init__.py").exists())
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
@@ -26,7 +26,7 @@ from datetime import datetime
 import uuid
 
 # 复用 agent_core 的全部逻辑
-from agent.core.agent_core import (
+from ResearcherAgent.core.agent_core import (
     runtime,
     save_conversation_turn,
     load_conversation_history,
@@ -93,7 +93,7 @@ async def main():
             async for output in runtime.app.astream(inputs, config=config):
                 for node_name, value in output.items():
                     # 打印节点名称
-                    from agent.core.agent_core import NODE_LABELS
+                    from ResearcherAgent.core.agent_core import NODE_LABELS
                     label = NODE_LABELS.get(node_name, f"执行节点 [{node_name}]...")
                     print(f"  {label}")
 

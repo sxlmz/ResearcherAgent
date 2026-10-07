@@ -19,7 +19,7 @@ import threading
 import time
 from pathlib import Path
 
-from agent.core.paths import REPO_ROOT
+from ResearcherAgent.core.paths import REPO_ROOT
 
 DB_PATH = REPO_ROOT / "logs" / "retrieval_cache.db"
 TTL = 7 * 24 * 3600          # SQLite 层 7 天（比 Redis 24h 长，作持久兜底）
@@ -105,7 +105,7 @@ def search_get(source: str, query, max_results=0):
         _mem_set(source, key, row[0], row[1])
         return row[0]
     try:
-        from agent.core import cache
+        from ResearcherAgent.core import cache
         v = cache.search_get(source, query, max_results)
         if v is not None:
             exp = time.time() + TTL
@@ -127,7 +127,7 @@ def search_set(source: str, query, max_results=0, payload=None):
     _mem_set(source, key, payload, exp)
     _db_set(source, key, payload, exp)
     try:
-        from agent.core import cache
+        from ResearcherAgent.core import cache
         cache.search_set(source, query, max_results, payload)
     except Exception:
         pass

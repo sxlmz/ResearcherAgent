@@ -26,7 +26,7 @@ Python 不做 JWT 校验——认证已在 Java 层完成，Python 在内网只�
 # --- repo-root bootstrap：保证 `python <本文件>` 在任意 cwd 下都能 import 到包 ---
 import sys
 from pathlib import Path
-_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "agent" / "__init__.py").exists())
+_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "ResearcherAgent" / "__init__.py").exists())
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 from contextlib import asynccontextmanager
@@ -46,20 +46,20 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
-from agent.core.agent_core import (
+from ResearcherAgent.core.agent_core import (
     runtime,
     run_stream,
     load_conversation_messages,
     delete_conversation,
 )
-from agent.memory.memory_manager import _current_user_id
-from agent.memory.conversation_manager import (
+from ResearcherAgent.memory.memory_manager import _current_user_id
+from ResearcherAgent.memory.conversation_manager import (
     register_conversation,
     add_conversation_file,
     list_conversations,
     _load_conv_index,
 )
-from agent.retrieval.rag_pipeline import save_upload, extract_text, UPLOAD_DIR
+from ResearcherAgent.retrieval.rag_pipeline import save_upload, extract_text, UPLOAD_DIR
 from pathlib import Path as _Path
 
 
@@ -179,7 +179,7 @@ async def upload_file(
     doc_id = ""
     try:
         import hashlib
-        from agent.memory.memory_stack import PostgresStore
+        from ResearcherAgent.memory.memory_stack import PostgresStore
         doc_id = hashlib.sha256(dest.resolve().as_posix().encode()).hexdigest()[:16]
         PostgresStore().upsert_document(doc_id, user_id, file.filename,
                                         source_key=str(dest), version=1)
@@ -355,7 +355,7 @@ async def document_delete(request: Request, doc_id: str):
     """
     user_id = get_user_id(request)
     _current_user_id.set(user_id)
-    from agent.memory.memory_integration import delete_document
+    from ResearcherAgent.memory.memory_integration import delete_document
     delete_document(user_id, doc_id)
     return JSONResponse({"ok": True, "doc_id": doc_id})
 
@@ -368,7 +368,7 @@ async def trace_get(
 ):
     """可观测性：返回该 thread 的汇总（steps/tool_calls/tokens/失败数）与最近 spans（logs/trace.jsonl）。"""
     get_user_id(request)
-    from agent.core import tracing
+    from ResearcherAgent.core import tracing
     return JSONResponse({
         "thread_id": thread_id,
         "summary": tracing.summary(thread_id),
@@ -392,5 +392,5 @@ async def _error_stream(message: str):
 # （根 server.py → 本模块的 app）。
 #
 # ⚠️ 这里**故意不放** `if __name__ == "__main__"` 自启动块：
-# 直接 `python agent/interfaces/server.py` 会让本模块同时以 __main__ 和
+# 直接 `python ResearcherAgent/interfaces/server.py` 会让本模块同时以 __main__ 和
 # agent.interfaces.server 两个名字各导入一次，产生两个 AgentRuntime 单例、两个 FastAPI app。

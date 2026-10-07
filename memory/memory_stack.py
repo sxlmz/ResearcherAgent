@@ -17,7 +17,7 @@ infinity-sdk 0.7.2 的原生绑定在 Python 3.13 下段错误，因此本模块
   - Redis：DB 0，键均带 user/session 前缀。
 
 用法（供 memory_orchestrator / memory_classifier 调用）：
-    from agent.memory.memory_stack import MemoryStack
+    from ResearcherAgent.memory.memory_stack import MemoryStack
     stack = MemoryStack(embed_fn=embed)   # embed_fn: str -> list[float]
     stack.infinity.save_conversation_turn(900001, "session_12345", "user", "你好", embed)
     stack.pg.upsert_profile(900001, "USER", "偏好：APA 引用", "session_1")

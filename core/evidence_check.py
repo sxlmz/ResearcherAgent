@@ -15,7 +15,7 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from agent.core.paths import REPO_ROOT
+from ResearcherAgent.core.paths import REPO_ROOT
 
 load_dotenv(REPO_ROOT / ".env")
 
@@ -75,7 +75,7 @@ def build_cite_map_from_pool(draft, pool):
     pool 论文 dict 需含 title（+ abstract/paper/summary 之一）。这是确定性证据检查
     的**正确口径**：正文引用 71 个编号 → 71 篇池论文全可定位，不再误报 no_anchor。
     """
-    from agent.tools.agent_tools import global_index, paper_key
+    from ResearcherAgent.tools.agent_tools import global_index, paper_key
     gidx = global_index(pool or [])
     rev = {}
     for p in (pool or []):
@@ -201,7 +201,7 @@ def check_section_deterministic(section_text, cite_map, embed_fn, cos_cache,
         nli = None
         if use_nli:
             try:
-                from agent.core.nli_evidence import nli_verdict
+                from ResearcherAgent.core.nli_evidence import nli_verdict
                 nli = nli_verdict(ev, sent)
             except Exception:
                 nli = None

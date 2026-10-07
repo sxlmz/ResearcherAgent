@@ -22,24 +22,24 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, Tool
 from langchain_core.prompts import ChatPromptTemplate
 from langgraph.graph.message import add_messages
 
-from agent.core.skill_manager import (build_skill_index, validate_skills,
+from ResearcherAgent.core.skill_manager import (build_skill_index, validate_skills,
     needs_search_papers, needs_tools,
     needs_index_file, needs_write_review,
     needs_content_safety, needs_human_review)
-from agent.memory.memory_manager import load_all_for_prompt
-from agent.core.config import (MAX_REWRITE_ROUNDS, MAX_RE_RESEARCH, JUDGE_PASS_THRESHOLD,
+from ResearcherAgent.memory.memory_manager import load_all_for_prompt
+from ResearcherAgent.core.config import (MAX_REWRITE_ROUNDS, MAX_RE_RESEARCH, JUDGE_PASS_THRESHOLD,
     MAX_AGENT_STEPS, TOKEN_BUDGET, KEEP_RECENT_TOOL_MESSAGES,
     WRITE_SECTION_BUDGET, MAX_REVIEW_CHARS, SECTION_OVERFLOW_TOLERANCE, REVIEW_READ_MAX,
     _TOOL_FAILURE_PHRASES, _TOOL_FAILURE_HEURISTIC_MAX_LEN,
     _CONTENT_SAFETY_DIMS, _CONTENT_SAFETY_THRESHOLD, _BASE_SAFETY_INSTRUCTION,
     REJECT_MALICIOUS_THRESHOLD, REJECT_RESEARCHABLE_THRESHOLD, REJECT_RATIO_THRESHOLD)
-from agent.tools.agent_tools import (merge_papers, merge_paper_cards, render_pool, select_tools,
+from ResearcherAgent.tools.agent_tools import (merge_papers, merge_paper_cards, render_pool, select_tools,
                                      merge_innovations, merge_experiments,
                          build_references, render_section_candidates)
 
 import time
-from agent.core import cache
-from agent.core import tracing
+from ResearcherAgent.core import cache
+from ResearcherAgent.core import tracing
 
 
 # ==========================================
@@ -306,7 +306,7 @@ async def parse_intent_node(state: AgentState, llm):
     调度器只做前提条件校验，不做启发式猜测。
     """
     # load_conversation_history is imported from agent_core
-    from agent.memory.conversation_manager import load_conversation_history
+    from ResearcherAgent.memory.conversation_manager import load_conversation_history
 
     print("--> [Parse] 正在解析用户意图...")
     user_request = state["user_request"]
@@ -440,9 +440,9 @@ def route_after_parse(state: AgentState) -> str:
 
 async def simple_chat_node(state: AgentState, llm):
     """【节点 · 简单对话】无需 MCP，直接由 LLM 回答"""
-    from agent.memory.conversation_manager import load_conversation_history, save_conversation_turn
-    from agent.memory.memory_manager import _current_user_id
-    from agent.memory.memory_integration import get_orchestrator
+    from ResearcherAgent.memory.conversation_manager import load_conversation_history, save_conversation_turn
+    from ResearcherAgent.memory.memory_manager import _current_user_id
+    from ResearcherAgent.memory.memory_integration import get_orchestrator
 
     print("--> [SimpleChat] 正在生成回答...")
     user_request = state["user_request"]
@@ -492,9 +492,9 @@ def _process_file_impl(state: AgentState, llm) -> dict:
     """
     import hashlib
     from pathlib import Path
-    from agent.retrieval.rag_pipeline import extract_text, sentence_tokenize, chunk_sentences
-    from agent.memory.memory_manager import _current_user_id
-    from agent.memory.memory_integration import get_orchestrator
+    from ResearcherAgent.retrieval.rag_pipeline import extract_text, sentence_tokenize, chunk_sentences
+    from ResearcherAgent.memory.memory_manager import _current_user_id
+    from ResearcherAgent.memory.memory_integration import get_orchestrator
 
     print("--> [FileProcess] 正在处理文件（Infinity 文档检索）...")
     file_path = state.get("file_path", "")
@@ -548,7 +548,7 @@ def _process_file_impl(state: AgentState, llm) -> dict:
 
 async def file_qa_node(state: AgentState, llm):
     """【节点 · 文件问答】基于 RAG 检索结果回答用户问题"""
-    from agent.memory.conversation_manager import save_conversation_turn
+    from ResearcherAgent.memory.conversation_manager import save_conversation_turn
 
     print("--> [FileQA] 正在基于文件内容生成回答...")
     rag_context = state.get("rag_context", "")
@@ -635,8 +635,8 @@ async def _save_format_to_memory(user_request: str, rag_context: str, llm):
     # 精炼写入 Postgres 用户档案（USER，新系统）
     summary = analysis.strip()[:300]
     entry = f"写作格式偏好（用户: {user_request[:80]}）\n{summary}"
-    from agent.memory.memory_manager import _current_user_id
-    from agent.memory.memory_integration import store_profile
+    from ResearcherAgent.memory.memory_manager import _current_user_id
+    from ResearcherAgent.memory.memory_integration import store_profile
     uid = _current_user_id.get()
     if uid is not None:
         store_profile(uid, "USER", entry, "")
@@ -923,8 +923,8 @@ def make_agent_node(llm, mcp_tools: dict, local_tools: dict):
     """构造 agent 节点：按 skills 绑定工具子集（渐进式加载）+ 护栏 + 记忆注入。"""
 
     async def agent_node(state: AgentState):
-        from agent.memory.memory_manager import _current_user_id
-        from agent.memory.memory_integration import get_orchestrator
+        from ResearcherAgent.memory.memory_manager import _current_user_id
+        from ResearcherAgent.memory.memory_integration import get_orchestrator
 
         skills = state.get("skills", [])
         thread_id = state.get("session_id", "")
@@ -943,7 +943,7 @@ def make_agent_node(llm, mcp_tools: dict, local_tools: dict):
                 updates["historical_knowledge"] = ""
             # CC 风格项目记忆（Claude Code Auto Memory 模式）：MEMORY.md 全局注入
             try:
-                from agent.memory.cc_memory import read_memory_for_inject
+                from ResearcherAgent.memory.cc_memory import read_memory_for_inject
                 _cc_ctx = read_memory_for_inject()
                 if _cc_ctx:
                     _base = updates.get("historical_knowledge") or ""
@@ -1118,7 +1118,7 @@ def _get_ev_embed_fn():
     global _ev_embed_fn
     if _ev_embed_fn is None:
         try:
-            from agent.memory.memory_classifier import make_embed_fn
+            from ResearcherAgent.memory.memory_classifier import make_embed_fn
             _ev_embed_fn = make_embed_fn()
         except Exception:
             _ev_embed_fn = None
@@ -1155,6 +1155,55 @@ def _split_passages(text: str, max_para: int = 900) -> list:
         if c:
             out.append({"sec": cur_sec, "text": c})
     return out
+
+
+_ARXIV_CODE_URL_CACHE: dict = {}
+
+
+def _arxiv_code_url(arxiv_id: str) -> str:
+    """arXiv API 元数据提取作者标注的开源代码链接（abstract 常含 'code: github.com/...'）。
+    带会话内缓存，避免重复调用。"""
+    if not arxiv_id or not re.match(r"^\d{4}\.\d{4,5}", arxiv_id):
+        return ""
+    if arxiv_id in _ARXIV_CODE_URL_CACHE:
+        return _ARXIV_CODE_URL_CACHE[arxiv_id]
+    import urllib.request
+    url = ""
+    try:
+        with urllib.request.urlopen(
+                f"https://export.arxiv.org/api/query?id_list={arxiv_id}", timeout=15) as r:
+            xml = r.read().decode("utf-8", errors="replace")
+        url = _extract_github_url(xml)
+    except Exception:
+        pass
+    _ARXIV_CODE_URL_CACHE[arxiv_id] = url
+    return url
+
+
+def _paper_code_url(blk: dict, text: str) -> str:
+    """论文代码链接：arXiv API 元数据优先（作者标注，精准）→ 全文正则兜底。"""
+    pid = blk.get("id", "") if isinstance(blk, dict) else ""
+    u = _arxiv_code_url(pid)
+    if not u:
+        u = _extract_github_url(text or "")
+    return u
+
+
+_GITHUB_URL_RE = re.compile(
+    r"(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?"
+    r"(?=[/#\s.,;:)\]）】]|$)|"
+    r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?(?=[\s.,;:)\]）】]|$)",
+    re.I)
+
+
+def _extract_github_url(text: str) -> str:
+    """从全文确定性提取论文标注的开源代码链接（GitHub）；无则返回空串。"""
+    m = _GITHUB_URL_RE.search(text or "")
+    if not m:
+        return ""
+    owner = m.group(1) or m.group(3)
+    repo = m.group(2) or m.group(4)
+    return f"https://github.com/{owner}/{repo}"
 
 
 def _map_to_cards(blocks: list, llm) -> list:
@@ -1228,7 +1277,8 @@ def _map_to_cards(blocks: list, llm) -> list:
         if passages:
             card_txt = "\n".join(f"【§{p['sec'] or '?'}】{p['text']}" for p in passages)
             cards.append({"title": title, "id": blk.get("id", "") if isinstance(blk, dict) else "",
-                          "section": sec, "card": card_txt, "passages": passages})
+                          "section": sec, "card": card_txt, "passages": passages,
+                          "code_url": _paper_code_url(blk, text)})
     if _n_hit:
         print(f"    ♻️ [L1] 原文证据段落缓存命中 {_n_hit}/{len(blocks)} 篇")
     return cards
@@ -1302,7 +1352,7 @@ def answer_node(state: AgentState):
     只做两件事：工具全部失败时的兜底提示（保留 detect_tool_failure 判定）+ 存 JSONL。
     （旧版是再调一次 LLM 基于 papers_data 合成回答；现在合成由 agent 循环里的模型自己完成。）
     """
-    from agent.memory.conversation_manager import save_conversation_turn
+    from ResearcherAgent.memory.conversation_manager import save_conversation_turn
 
     messages = state.get("messages", [])
     answer = _last_ai_text(messages)
@@ -1445,7 +1495,7 @@ def write_review_node(state: AgentState, llm):
     #   ⚠️ 这段必须在 `pool` 定义**之后**——否则 build_cite_map_from_pool 拿不到池。
     if rewrite_count > 0:
         try:
-            from agent.core.evidence_check import (build_cite_map_from_pool, render_writer_evidence)
+            from ResearcherAgent.core.evidence_check import (build_cite_map_from_pool, render_writer_evidence)
             _ev = render_writer_evidence(
                 state.get("evidence_report") or {},
                 build_cite_map_from_pool(state.get("draft_review") or "", pool))
@@ -1638,8 +1688,8 @@ def judge_review_node(state: AgentState, judge_llm):
     draft = state.get("draft_review", "")
     # ── 写后确定性约束：正文 [N] 必须属于「有原文段落证据」的论文（证据闭环最后一步）──
     try:
-        from agent.tools.agent_tools import global_index, paper_key, _norm_card_title
-        from agent.core.evidence_check import enforce_citation_domain
+        from ResearcherAgent.tools.agent_tools import global_index, paper_key, _norm_card_title
+        from ResearcherAgent.core.evidence_check import enforce_citation_domain
         _pool = state.get("paper_pool") or []
         _cards = state.get("paper_cards") or []
         _gidx = global_index(_pool)
@@ -1696,7 +1746,7 @@ def judge_review_node(state: AgentState, judge_llm):
     # ── 引用精确映射 + 确定性证据检查（bge-m3 余弦 + 锚点存在性）──
     # 口径：基于 paper_pool 的稳定全局编号反查（正文 71 个编号 → 71 篇池论文全可定位），
     # 不再用精读卡片（卡片只覆盖 13/71 → 会把 58 篇非卡片引用误报为 no_anchor）。
-    from agent.core.evidence_check import (build_cite_map_from_pool, check_section_deterministic,
+    from ResearcherAgent.core.evidence_check import (build_cite_map_from_pool, check_section_deterministic,
                                 summarize_findings)
     _pool = state.get("paper_pool") or []
     cite_map = build_cite_map_from_pool(draft, _pool)
@@ -1719,7 +1769,7 @@ def judge_review_node(state: AgentState, judge_llm):
     _embed_fn = None
     _cos_cache = {}
     try:
-        from agent.memory.memory_classifier import make_embed_fn
+        from ResearcherAgent.memory.memory_classifier import make_embed_fn
         _embed_fn = make_embed_fn()
     except Exception as e:
         print(f"--> [Judge] ⚠️ embedding 初始化失败（确定性检查降级跳过）: {str(e)[:60]}")
@@ -1731,7 +1781,7 @@ def judge_review_node(state: AgentState, judge_llm):
     #   实测导致重写越多忠实度越低（judgev3c：5.2→4.7 六轮净跌）。
     det_raw: dict[str, list] = {}
     if _embed_fn is not None:
-        from agent.core.evidence_check import build_ref_sample
+        from ResearcherAgent.core.evidence_check import build_ref_sample
         _ref = build_ref_sample(cite_map)      # 对比参照（非被引论文），用于边距判定
         for _s in _sections:
             _f = check_section_deterministic(_s["text"], cite_map, _embed_fn, _cos_cache,
@@ -2219,7 +2269,7 @@ def save_node(state: AgentState):
     不再自动存到 reviews/ 目录——综述内容已在 JSONL 对话历史中保留，
     前端也提供下载按钮，磁盘冗余副本没有存在必要且删除对话时无法清理。
     """
-    from agent.memory.conversation_manager import save_conversation_turn
+    from ResearcherAgent.memory.conversation_manager import save_conversation_turn
 
     session_id = state.get("session_id", "")
     topic = state.get("topic", "unknown")

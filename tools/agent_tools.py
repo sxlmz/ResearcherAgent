@@ -33,19 +33,19 @@ from langgraph.prebuilt import InjectedState
 from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 
-from agent.core.config import (
+from ResearcherAgent.core.config import (
     TOOL_CONCURRENCY, MAX_TOOL_RESULT_CHARS, MAX_SEARCH_ROUNDS,
     PAPER_SEARCH_TOOL_WHITELIST, WEB_SEARCH_TOOL_PREFIXES,
     SECTION_CANDIDATES_K, RERANK_MIN_SCORE, CARDS_PER_SECTION,
     SRC_FAIL_STREAK, SRC_COOLDOWN_SEC, MCP_CALL_TIMEOUT_SEC, RETRY_BACKOFF_SEC,
 )
-from agent.core import cache
-from agent.core import tracing
+from ResearcherAgent.core import cache
+from ResearcherAgent.core import tracing
 
-from agent.research import llm_seeds
-from agent.research import must_read as mr
-from agent.research import discover_directions as dd
-from agent.retrieval import retrieval_cache as rcache
+from ResearcherAgent.research import llm_seeds
+from ResearcherAgent.research import must_read as mr
+from ResearcherAgent.research import discover_directions as dd
+from ResearcherAgent.retrieval import retrieval_cache as rcache
 
 
 # ==========================================
@@ -265,7 +265,7 @@ def select_section_candidates(pool: list, outline: list, k: int = SECTION_CANDID
     返回 {section: {"query":..., "candidates":[{idx,key,score,title,has_abstract}]}}；
     重排 API 不可用时返回 {}（调用方自动降级回旧排序）。
     """
-    from agent.retrieval import rerank as _rerank
+    from ResearcherAgent.retrieval import rerank as _rerank
     pool = [p for p in (pool or []) if isinstance(p, dict)]
     if not pool or not outline or not _rerank.available():
         if pool and outline and not _rerank.available():
@@ -1336,8 +1336,8 @@ def fetch_and_card(items: list, llm, thread_id: str = "") -> tuple[list, list]:
     共用同一套「取全文 + 提炼卡片」逻辑，避免两份实现漂移。
     返回 (cards, failed_ids)。
     """
-    from agent.core.graph_nodes import _title_relevant, _map_to_cards
-    from agent.retrieval.fulltext import (fetch_arxiv_fulltext, fetch_pmc_fulltext,
+    from ResearcherAgent.core.graph_nodes import _title_relevant, _map_to_cards
+    from ResearcherAgent.retrieval.fulltext import (fetch_arxiv_fulltext, fetch_pmc_fulltext,
                                       fetch_oa_fulltext)
 
     def _fetch(it: dict) -> dict | None:
@@ -1464,8 +1464,8 @@ def make_read_papers(llm):
         ids：arXiv id（如 2301.12345）或 PMCID（如 PMC1234567），一次最多 6 个，**并发获取**。
         取不到全文的会跳过（不编造）。
         """
-        from agent.core.graph_nodes import _title_relevant, _map_to_cards
-        from agent.retrieval.fulltext import fetch_arxiv_fulltext, fetch_pmc_fulltext
+        from ResearcherAgent.core.graph_nodes import _title_relevant, _map_to_cards
+        from ResearcherAgent.retrieval.fulltext import fetch_arxiv_fulltext, fetch_pmc_fulltext
 
         thread_id = state.get("session_id", "")
         pool = state.get("paper_pool", []) or []
@@ -1711,7 +1711,7 @@ def build_local_tools(llm) -> dict[str, BaseTool]:
         "ask_user": ask_user,
     }
     # —— 代码执行工具组（skill "code_exec" 启用；照搬 HKUDS/AI-Researcher terminal_tools）——
-    from agent.sandbox.code_executor import (
+    from ResearcherAgent.sandbox.code_executor import (
         execute_command, read_file, create_file, write_file,
         list_files, create_directory, gen_code_tree_structure, run_python,
     )
@@ -1726,21 +1726,24 @@ def build_local_tools(llm) -> dict[str, BaseTool]:
         "run_python": run_python,
     })
     # —— 创新点验证工具组（skill "innovate" 启用：检索精读(复用) → 创新点 → 实验 → 修复重跑 → 判定）——
-    from agent.innovate.innovation_tools import (
-        make_propose_innovations, make_implement_innovation,
+    from ResearcherAgent.innovate.innovation_tools import (
+        make_deep_survey, make_propose_innovations, make_implement_innovation,
         make_judge_innovation, make_fix_and_rerun, run_baseline,
-        make_novelty_check,
+        make_novelty_check, make_code_survey, make_prepare_reference_repos,
     )
     out.update({
+        "deep_survey": make_deep_survey(llm),
         "propose_innovations": make_propose_innovations(llm),
+        "prepare_reference_repos": make_prepare_reference_repos(llm),
         "run_baseline": run_baseline,
         "implement_innovation": make_implement_innovation(llm),
         "fix_and_rerun": make_fix_and_rerun(llm),
         "judge_innovation": make_judge_innovation(llm),
         "novelty_check": make_novelty_check(llm),
+        "code_survey": make_code_survey(llm),
     })
     # —— CC 风格项目记忆（Claude Code Auto Memory 模式）：remember 记录 / consolidate 整理 ——
-    from agent.memory.cc_memory import remember_memory, make_consolidate_memory
+    from ResearcherAgent.memory.cc_memory import remember_memory, make_consolidate_memory
     out.update({
         "remember_memory": remember_memory,
         "consolidate_memory": make_consolidate_memory(llm),
@@ -1765,15 +1768,15 @@ def select_tools(skills: list[str], mcp_tools: dict[str, BaseTool],
         out.append(local_tools["ask_user"])
     if "code_exec" in skills:
         # 代码执行工具组：模型可写文件、跑命令、跑训练脚本（后端由 LANGGRAPH_EXEC_BACKEND 控制）
-        from agent.sandbox.code_executor import CODE_EXEC_TOOLS
+        from ResearcherAgent.sandbox.code_executor import CODE_EXEC_TOOLS
         out += [local_tools[k] for k in CODE_EXEC_TOOLS if k in local_tools]
         # CC 风格项目记忆（跨会话沉淀，与代码执行配套）
         out += [local_tools[k] for k in ("remember_memory", "consolidate_memory")
                 if k in local_tools]
     if "innovate" in skills:
         # 创新点验证流水线：检索 + 精读制卡（复用）+ 创新工具 + 代码执行
-        from agent.innovate.innovation_tools import INNOVATE_TOOLS
-        from agent.sandbox.code_executor import CODE_EXEC_TOOLS
+        from ResearcherAgent.innovate.innovation_tools import INNOVATE_TOOLS
+        from ResearcherAgent.sandbox.code_executor import CODE_EXEC_TOOLS
         out += [t for n, t in mcp_tools.items() if is_paper_search_tool(n)]
         out += [local_tools[k] for k in ("read_papers", "read_sections")
                 if k in local_tools]

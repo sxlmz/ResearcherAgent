@@ -26,8 +26,8 @@ from langchain_core.tools import tool, InjectedToolCallId
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 
-from agent.core import tracing
-from agent.sandbox.sandbox_exec import get_env
+from ResearcherAgent.core import tracing
+from ResearcherAgent.sandbox.sandbox_exec import get_env
 
 # ---------------------------------------------------------------------------
 # 常量与结构

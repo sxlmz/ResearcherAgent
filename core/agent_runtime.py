@@ -29,9 +29,9 @@ from langgraph.types import RetryPolicy
 from langchain_mcp_adapters.client import MultiServerMCPClient
 from langchain_mcp_adapters.tools import load_mcp_tools
 
-from agent.core.config import MCP_CONFIG, CHECKPOINTER, model_mode
-from agent.tools.agent_tools import wrap_mcp_tool, build_local_tools, is_paper_search_tool, is_web_search_tool
-from agent.core.graph_nodes import (
+from ResearcherAgent.core.config import MCP_CONFIG, CHECKPOINTER, model_mode
+from ResearcherAgent.tools.agent_tools import wrap_mcp_tool, build_local_tools, is_paper_search_tool, is_web_search_tool
+from ResearcherAgent.core.graph_nodes import (
     AgentState,
     parse_intent_node,
     simple_chat_node,
@@ -129,7 +129,7 @@ def _build_checkpointer():
         return MemorySaver(), None
     try:
         from psycopg_pool import ConnectionPool
-        from agent.memory.memory_stack import PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DB
+        from ResearcherAgent.memory.memory_stack import PG_HOST, PG_PORT, PG_USER, PG_PASSWORD, PG_DB
         dsn = f"postgresql://{PG_USER}:{PG_PASSWORD}@{PG_HOST}:{PG_PORT}/{PG_DB}"
         pool = ConnectionPool(dsn, min_size=1, max_size=5, open=True, timeout=5,
                               kwargs={"autocommit": True, "prepare_threshold": 0})

@@ -8,15 +8,15 @@ Harness-style AI Agent — 体现 harness 编程思想：模型自行判断、�
 """
 
 # ── 外部消费者需要的符号（server.py / arxiv_agent.py）──
-from agent.memory.conversation_manager import (
+from ResearcherAgent.memory.conversation_manager import (
     _session_path, save_conversation_turn,
     load_conversation_history, load_conversation_messages,
     register_conversation, set_conversation_title,
     add_conversation_file, delete_conversation,
 )
-from agent.memory.memory_manager import _current_user_id
-from agent.core.agent_runtime import runtime, NODE_LABELS
-from agent.core import tracing
+from ResearcherAgent.memory.memory_manager import _current_user_id
+from ResearcherAgent.core.agent_runtime import runtime, NODE_LABELS
+from ResearcherAgent.core import tracing
 
 import asyncio
 from typing import AsyncGenerator
@@ -25,7 +25,7 @@ from typing import AsyncGenerator
 def _cache_summary() -> dict:
     """五层缓存的命中率汇总（失败不影响主流程）。"""
     try:
-        from agent.core import cache
+        from ResearcherAgent.core import cache
         return cache.summary()
     except Exception:
         return {}
@@ -153,8 +153,8 @@ async def run_stream(
         # ---- 记忆提取：LLM-as-Judge 分类存储（L1 Postgres + L2 Infinity） ----
         if final_review and runtime.llm:
             try:
-                from agent.memory.memory_classifier import classify_and_store as _classify_and_store
-                from agent.memory.memory_integration import get_orchestrator
+                from ResearcherAgent.memory.memory_classifier import classify_and_store as _classify_and_store
+                from ResearcherAgent.memory.memory_integration import get_orchestrator
                 uid = _current_user_id.get()
                 if uid is not None:
                     orch = get_orchestrator()

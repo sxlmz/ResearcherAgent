@@ -46,12 +46,23 @@ def _strip_tags(html: str) -> str:
     return html.strip()
 
 
+_A_HREF_RE = re.compile(r"(?is)<a\s[^>]*href\s*=\s*[\"']([^\"']+)[\"'][^>]*>")
+
+
+def _preserve_links(html: str) -> str:
+    """HTML 转文本前保留 a[href]：<a href="URL">文本</a> → "URL 文本"。
+    论文标注的开源代码链接（github.com/...）通常藏在 href 里，去标签会丢。"""
+    return _A_HREF_RE.sub(lambda m: m.group(1) + " ", html)
+
+
 def _extract_sections_from_html(html: str, max_chars: int, section_max: int = 6000) -> str:
     """从 ar5iv XHTML 里按 h1-h6 提 section。
 
     section_max：单节正文上限（默认 6000 字符，覆盖绝大多数论文单节长度）；
     不再把每节砍到 2000——那是"只读前 6000 字"的根因之一。
     """
+    # 保留链接后转文本（否则 github 代码链接会丢）
+    html = _preserve_links(html)
     # 退化：直接去标签
     try:
         # 按标题切段
@@ -171,7 +182,7 @@ def fetch_oa_fulltext(url: str, max_chars: int = 30000, section_max: int = 6000)
     try:
         key = os.environ.get("TAVILY_API_KEY") or ""
         if not key:
-            from agent.core.config import _tavily_key
+            from ResearcherAgent.core.config import _tavily_key
             key = _tavily_key or ""
         if key:
             body = json.dumps({"api_key": key, "urls": [url],

@@ -17,7 +17,7 @@ import json
 
 from openai import OpenAI
 
-from agent.memory.memory_stack import MemoryStack
+from ResearcherAgent.memory.memory_stack import MemoryStack
 
 
 # 对话模型（记忆分类用）——归 router 角色。
@@ -106,7 +106,7 @@ def make_embed_fn():
         # ---- L2 缓存：同一段文本反复 embed 是常态（对话轮次、文档 chunk）----
         _cache = None
         try:
-            from agent.core import cache as _cache
+            from ResearcherAgent.core import cache as _cache
             hit = _cache.embed_get(EMBED_MODEL, text)
             if hit is not None:
                 return hit

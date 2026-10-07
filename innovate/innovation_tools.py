@@ -5,10 +5,18 @@ innovation_tools.py — 「文献综述 → 创新点验证」流水线工具集
 流水线（模型在 agent 循环中自由编排，工具只提供能力）：
   1. search_papers（复用 MCP 检索）          → paper_pool
   2. read_papers / read_sections（复用精读制卡）→ paper_cards
-  3. propose_innovations                     → LLM 基于卡片提出 3-5 个创新点（state.innovations）
-  4. run_baseline                            → 确定性工具：跑 PatchTST 基线，得基线指标
-  5. implement_innovation                    → LLM 为指定创新点生成实验代码 → 沙箱运行 → 实验指标
-  6. judge_innovation                        → LLM 对比基线 vs 实验，判断可行性
+  3. deep_survey（新增，照搬 AI-Researcher Paper Survey）→ 把主题拆成原子学术定义，
+     从卡片提取数学公式/理论 → state.survey_notes
+  4. propose_innovations（改造，照搬 idea_agent）→ 基于 survey_notes 生成 5 个结构化
+     proposal（Challenges/Motivation/Proposed Method/数学公式/Expected Outcomes）
+     → 横向比较择优增强 → state.innovations
+  5. novelty_check                          → 多源检索查重，duplicate 自动拦截
+  6. code_survey（新增，照搬 Code Survey Agent）→ 创新点 + 参考代码库 → 实现报告
+     （每个关键机制 → 可复用代码 + 需新增部分）→ state.code_survey_reports
+  7. run_baseline                            → 确定性工具：跑 PatchTST 基线，得基线指标
+  8. implement_innovation                    → LLM 为指定创新点生成实验代码（注入实现报告）
+     → 沙箱运行 → 实验指标
+  9. judge_innovation                        → LLM 对比基线 vs 实验，判断可行性
 
 复用约定：
 - 检索/精读/卡片机制完全复用现有组件（MCP 检索工具 + read_papers + paper_cards）。
@@ -30,16 +38,17 @@ from langchain_core.tools import tool, InjectedToolCallId
 from langgraph.prebuilt import InjectedState
 from langgraph.types import Command
 
-from agent.core import tracing
-from agent.sandbox import code_executor as ce
-from agent.sandbox.sandbox_exec import PROJECT_ROOT, get_env
-from agent.memory import cc_memory
+from ResearcherAgent.core import tracing
+from ResearcherAgent.sandbox import code_executor as ce
+from ResearcherAgent.sandbox.sandbox_exec import PROJECT_ROOT, get_env
+from ResearcherAgent.memory import cc_memory
 
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
-INNOVATE_TOOLS = ("propose_innovations", "run_baseline", "implement_innovation",
-                  "fix_and_rerun", "judge_innovation", "novelty_check")
+INNOVATE_TOOLS = ("deep_survey", "propose_innovations", "prepare_reference_repos", "run_baseline",
+                  "implement_innovation", "fix_and_rerun", "judge_innovation",
+                  "novelty_check", "code_survey")
 
 _METRIC_RE = re.compile(r"METRIC_JSON\s*=\s*(\{.*?\})\s*$", re.M | re.S)
 _CARD_MAX_CHARS = 1800          # 每张卡片注入 LLM 的截断长度
@@ -343,7 +352,74 @@ print("METRIC_JSON=" + json.dumps(metric, ensure_ascii=False))
 
 
 # ---------------------------------------------------------------------------
-# 1. propose_innovations —— 基于精读卡片提出 3-5 个创新点
+# 1. deep_survey —— 原子学术定义拆解 + 论文公式提取（照搬 AI-Researcher Paper Survey Agent）
+#    输入论文卡片，把研究主题拆成可实现的「原子学术定义」，逐一定义提取数学公式/理论基础，
+#    输出 state.survey_notes，作为 propose_innovations 的公式级输入。
+# ---------------------------------------------------------------------------
+def make_deep_survey(llm):
+    @tool
+    def deep_survey(
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        state: Annotated[dict, InjectedState],
+        topic: str | None = None,
+        max_definitions: int = 6,
+    ) -> Command:
+        """深度调研：把研究主题拆解为原子学术定义，并从论文卡片中提取每个定义的数学公式与理论。
+
+        适用：read_papers/read_sections 精读完成、paper_cards 已有卡片后调用（在 propose_innovations 之前）。
+        输出写入 state.survey_notes（definition / math_formula / theory / reference_papers / code_hints），
+        让后续创新点提出建立在「公式级理解」之上，而不是泛泛的论文要点。
+        """
+        cards = state.get("paper_cards") or []
+        if not cards:
+            return Command(update={"messages": [ToolMessage(
+                content="paper_cards 为空：请先调用 read_papers（精读 5-10 篇）再做深度调研。",
+                tool_call_id=tool_call_id, status="error")]})
+        theme = topic or state.get("topic") or state.get("user_request") or "该领域"
+        ctx = _cards_context(cards)
+        sys = (
+            "你是理论功底扎实的科研调研专家。任务：把研究主题拆解为若干「原子学术定义」。\n"
+            "原子学术定义的标准：\n"
+            "1) 单个自包含概念（如『Patch 嵌入与通道独立注意力』『可分解注意力』『频域损失项』），"
+            "不要合并多个概念；\n"
+            "2) 有明确的数学形式（公式/伪代码/变换定义）；\n"
+            "3) 可被代码实现（PyTorch 可写）；\n"
+            "4) 可追溯到具体论文。\n"
+            "对每个定义，从给定的论文精读卡片（含原文段落证据）中提取：数学公式、理论基础、"
+            "来源论文、实现要点提示。卡片中没有明确公式的定义，基于卡片内容做忠实归纳并标注"
+            "『（卡片未给公式，基于描述归纳）』。\n"
+            f"只输出一个 JSON 数组（3-{max_definitions} 个元素），字段：\n"
+            '   [{"definition": "原子学术定义", "math_formula": "数学公式（LaTeX 或文字公式）", '
+            '"theory": "理论基础（2-3 句）", "reference_papers": ["来源论文"], '
+            '"code_hints": "实现要点（结构/张量形状/损失项）"}]]'
+        )
+        user = f"研究主题：{theme}\n\n论文精读卡片：\n{ctx}"
+        with tracing.span("llm", "deep_survey", state.get("session_id", "")):
+            resp = llm.invoke([SystemMessage(content=sys), HumanMessage(content=user)])
+        data = _extract_json_block(resp.content if hasattr(resp, "content") else str(resp))
+        if not isinstance(data, list) or not data:
+            return Command(update={"messages": [ToolMessage(
+                content="模型未返回有效 survey_notes JSON，请重试或调整精读范围。",
+                tool_call_id=tool_call_id, status="error")]})
+        notes = data[: max_definitions] if max_definitions >= 3 else data
+        lines = [f"深度调研完成：拆解出 {len(notes)} 个原子学术定义："]
+        for i, d in enumerate(notes, 1):
+            formula = (d.get("math_formula") or "")[:90]
+            lines.append(f"{i}. {d.get('definition', '未命名')}")
+            lines.append(f"   公式：{formula}")
+        lines.append("")
+        lines.append("👉 下一步：调用 propose_innovations —— 它将基于这些公式级笔记"
+                     "生成 5 个结构化创新点方案并择优增强。")
+        return Command(update={
+            "survey_notes": notes,
+            "messages": [ToolMessage(content="\n".join(lines), tool_call_id=tool_call_id)],
+        })
+
+    return deep_survey
+
+
+# ---------------------------------------------------------------------------
+# 2. propose_innovations —— 基于精读卡片提出 3-5 个创新点
 # ---------------------------------------------------------------------------
 def make_propose_innovations(llm):
     @tool
@@ -353,51 +429,94 @@ def make_propose_innovations(llm):
         topic: str | None = None,
         count: int = 5,
     ) -> Command:
-        """基于已精读的论文卡片提出 3-5 个潜在创新点，存入 state.innovations。
+        """基于精读卡片/深度调研笔记提出创新点，存入 state.innovations（两阶段：生成→择优增强）。
 
-        适用：read_papers/read_sections 精读完成、paper_cards 已有卡片后调用。
-        topic：研究主题（默认用用户请求的主题）；count：创新点数量（3-5）。
-        每个创新点含：名称、假设、具体方法思路、基于哪些论文、预期提升、实现难度。
+        照搬 AI-Researcher idea_agent 逻辑：先基于 survey_notes（或论文卡片）生成
+        多个结构化 proposal（挑战/现有方法/动机/方法/数学公式/预期结果），再横向比较
+        新颖性/可行性/完整性，择优增强 1-2 个为最终创新点。
+        适用：deep_survey 之后（或 read_papers 完成后）；topic：研究主题；count：最终数量。
         """
         cards = state.get("paper_cards") or []
-        if not cards:
+        notes = state.get("survey_notes") or []
+        if not cards and not notes:
             return Command(update={"messages": [ToolMessage(
-                content="paper_cards 为空：还没有可依据的论文卡片。请先调用 read_papers（精读 5-10 篇）"
-                        "再提出创新点。",
+                content="paper_cards 与 survey_notes 均为空：请先调用 read_papers 精读，"
+                        "建议再调用 deep_survey 做原子定义拆解后再提出创新点。",
                 tool_call_id=tool_call_id, status="error")]})
 
         theme = topic or state.get("topic") or state.get("user_request") or "该领域"
-        ctx = _cards_context(cards)
-        sys = (
-            "你是科研方法论创新专家。基于给定的论文精读卡片（原文段落证据），为研究主题提出潜在创新点。"
+        evidence = ""
+        if notes:
+            evidence = "【深度调研笔记（原子学术定义 + 数学公式）】\n" + json.dumps(notes, ensure_ascii=False, indent=1)[:_CARD_MAX_CHARS * 3]
+        evidence += "\n\n【论文精读卡片】\n" + _cards_context(cards)
+        # ---- 阶段 1：生成 count*2 个结构化 proposal ----
+        sys1 = (
+            "你是科研方法论创新专家。基于给定的深度调研笔记（含原子定义与数学公式）与论文卡片，"
+            "为研究主题生成多个**结构化创新点方案**。\n"
             "要求：\n"
-            "1) 创新点必须**具体可实现**：基于 PyTorch、可直接在现有数据管线（长序列时间序列预测，"
-            "多变量，60/20/20 划分）上实现并对比基线（PatchTST）。\n"
-            "2) 每个创新点要有明确假设（为什么能提升）、具体方法思路（模型结构/训练方式的改动），"
-            "并注明基于哪些论文卡片。\n"
-            "3) 只输出一个 JSON 数组，不要输出其他文字。数组元素字段：\n"
-            '   [{"id": "inn_01", "name": "创新点名称", "hypothesis": "假设：为什么能提升", '
-            '"method": "具体实现思路（结构/模块/训练改动，300字内）", "based_on": "基于哪些论文", '
-            '"expected_gain": "预期在哪个指标/哪类序列上提升", "difficulty": "低/中/高"}]\n'
-            "4) 数量 3-5 个；至少 1 个低难度（数据/训练层面的小改动），至少 1 个中高难度（结构创新）。"
+            "1) 创新点必须具体可实现：基于 PyTorch、可直接在长序列时间序列预测管线"
+            "（多变量，60/20/20 划分）上实现并对比基线（PatchTST）。\n"
+            "2) 每个方案必须给出：挑战（现有方法瓶颈）、现有方法、动机、具体方法（结构/训练改动）、"
+            "数学公式（尽可能完整）、预期结果、基于哪些论文、难度。\n"
+            "3) 至少 1 个低难度（数据/训练层面小改动）、至少 1 个中高难度（结构创新）。\n"
+            '4) 只输出一个 JSON 数组，元素字段：\n'
+            '   [{"id": "inn_01", "name": "方案名称", "challenges": "现有瓶颈", '
+            '"existing_methods": "现有方法", "motivation": "动机", '
+            '"proposed_method": "具体方法（300字内）", "math_formula": "数学公式（尽量完整）", '
+            '"expected_outcomes": "预期结果", "based_on": "基于哪些论文", "difficulty": "低/中/高"}]'
         )
-        user = f"研究主题：{theme}\n\n论文精读卡片：\n{ctx}"
-        with tracing.span("llm", "propose_innovations", state.get("session_id", "")):
-            resp = llm.invoke([SystemMessage(content=sys), HumanMessage(content=user)])
-        data = _extract_json_block(resp.content if hasattr(resp, "content") else str(resp))
-        if not isinstance(data, list) or not data:
+        user1 = f"研究主题：{theme}\n\n{evidence}"
+        with tracing.span("llm", "propose_stage1", state.get("session_id", "")):
+            resp1 = llm.invoke([SystemMessage(content=sys1), HumanMessage(content=user1)])
+        proposals = _extract_json_block(resp1.content if hasattr(resp1, "content") else str(resp1))
+        if not isinstance(proposals, list) or not proposals:
             return Command(update={"messages": [ToolMessage(
-                content="模型未返回有效创新点 JSON，请重试或调整精读范围。",
+                content="模型未返回有效创新点方案 JSON，请重试或调整调研范围。",
                 tool_call_id=tool_call_id, status="error")]})
-        data = data[: count] if count >= 3 else data
-        lines = [f"已提出 {len(data)} 个潜在创新点："]
+        proposals = proposals[: max(6, count * 2)]
+        # ---- 阶段 2：择优增强 ----
+        brief = []
+        for i, p in enumerate(proposals, 1):
+            brief.append(f"[{i}] id={p.get('id')} 名称={p.get('name','')} 难度={p.get('difficulty','')}\n"
+                         f"    方法={p.get('proposed_method','')[:180]}\n"
+                         f"    公式={p.get('math_formula','')[:120]}")
+        sys2 = (
+            "你是科研想法评审专家。请横向比较下面的创新点方案，按 新颖性 > 可行性 > 完整性 > 影响力 "
+            "排序，选出最有潜力的 1-2 个，并对每个补全/增强为最终创新点。\n"
+            "输出一个 JSON 数组（最多 2 个元素），元素字段（兼容下游 novelty_check / implement）：\n"
+            '   [{"id": "inn_01", "name": "创新点名称", '
+            '"hypothesis": "假设：为什么能提升", '
+            '"method": "最终实现思路（结构/模块/训练改动，含关键公式描述，300字内）", '
+            '"math_formula": "数学公式（尽量完整）", "based_on": "基于哪些论文", '
+            '"expected_gain": "预期在哪个指标/哪类序列上提升", "difficulty": "低/中/高"}]'
+        )
+        user2 = "研究主题：{}\n\n候选方案：\n{}".format(theme, "\n".join(brief))
+        with tracing.span("llm", "propose_select", state.get("session_id", "")):
+            resp2 = llm.invoke([SystemMessage(content=sys2), HumanMessage(content=user2)])
+        data = _extract_json_block(resp2.content if hasattr(resp2, "content") else str(resp2))
+        if not isinstance(data, list) or not data:
+            # 择优失败则退回阶段 1 前 count 个（转成兼容字段）
+            data = []
+            for p in proposals[:count]:
+                data.append({"id": p.get("id"), "name": p.get("name", ""),
+                             "hypothesis": p.get("motivation", ""),
+                             "method": p.get("proposed_method", ""),
+                             "math_formula": p.get("math_formula", ""),
+                             "based_on": p.get("based_on", ""),
+                             "expected_gain": p.get("expected_outcomes", ""),
+                             "difficulty": p.get("difficulty", "中")})
+        data = data[: count] if count >= 1 else data[:1]
+        lines = [f"已提出并择优 {len(data)} 个创新点："]
         for i, d in enumerate(data, 1):
             lines.append(f"{i}. [{d.get('difficulty', '中')}] {d.get('name', '未命名')}"
                          f"（{d.get('based_on', '')[:40]}）")
             lines.append(f"   假设：{d.get('hypothesis', '')[:100]}")
+            if d.get("math_formula"):
+                lines.append(f"   公式：{d['math_formula'][:100]}")
         lines.append("")
-        lines.append("👉 下一步：调用 novelty_check 对这些创新点做新颖性查重（检索已有文献，"
-                     "判定是否已被提出），再为 novel / partially_explored 的创新点跑实验。")
+        lines.append("👉 下一步：调用 novelty_check 对创新点做新颖性查重（duplicate 会被自动拦截），"
+                     "再为 novel / partially_explored 的创新点调用 code_survey 获取参考代码库实现报告，"
+                     "最后跑实验。")
         return Command(update={
             "innovations": data,
             "messages": [ToolMessage(content="\n".join(lines), tool_call_id=tool_call_id)],
@@ -407,7 +526,367 @@ def make_propose_innovations(llm):
 
 
 # ---------------------------------------------------------------------------
-# 2. novelty_check —— 创新点新颖性查重（AI-Scientist Novelty Check 轻量版）
+# 3. code_survey —— 参考代码库调查 → 创新点实现报告（照搬 AI-Researcher Code Survey Agent）
+#    对选定创新点，读取参考代码库（工作区内目录，如 project/ 或用户提供的实现），
+#    输出每个创新点的「实现报告」：关键机制 → 参考代码中可复用实现 + 需新增部分。
+# ---------------------------------------------------------------------------
+_CODE_SURVEY_MAX_FILES = 6
+_CODE_SURVEY_CHARS = 3000
+
+
+def _pick_code_files(tree: str, base: str, max_files: int) -> list[str]:
+    """从代码树文本中按启发式挑选要精读的文件路径（相对工作区根）。
+
+    用 tree 缩进（每级 4 字符）重建完整相对路径，正确处理子目录：
+      project/
+      ├── dir/
+      │   └── main.py   →  "dir/main.py"
+      └── model.py      →  "model.py"
+    """
+    cands = []
+    dir_stack: list[str] = []
+    for line in (tree or "").splitlines():
+        if not line.strip():
+            continue
+        m = re.match(r"^([ │]*)[├└]──\s?(.*)$", line)
+        if not m:
+            continue
+        depth = len(m.group(1)) // 4
+        name = m.group(2).strip()
+        if name.endswith("/"):
+            dir_stack = dir_stack[:depth] + [name[:-1]]
+            continue
+        if name.endswith(".py"):
+            cands.append("/".join(dir_stack[:depth] + [name]))
+    keys = ("main", "run", "model", "train", "test", "data", "README", "readme")
+    scored = []
+    for c in cands:
+        cl = c.lower()
+        score = 0
+        for k in keys:
+            if k in cl:
+                score += 1
+        if cl.endswith("__init__.py"):
+            score -= 1
+        scored.append((score, len(c), c))
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    return [c for _, _, c in scored[:max_files]]
+
+
+def _parse_github_url(url: str) -> tuple | None:
+    """把论文标注的 GitHub 链接解析为 (owner, repo)；不支持/非 github 返回 None。"""
+    u = (url or "").strip()
+    m = re.match(
+        r"(?:https?://)?(?:www\.)?github\.com/([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)"
+        r"(?:\.git)?/?[\s.,;:)\]）】]*$", u, re.I)
+    if m:
+        return m.group(1), m.group(2)
+    m = re.match(r"git@github\.com:([A-Za-z0-9_.-]+)/([A-Za-z0-9_.-]+?)(?:\.git)?[\s.]*$", u, re.I)
+    if m:
+        return m.group(1), m.group(2)
+    return None
+
+
+def _github_search_repos(query: str, limit: int = 2, token: str | None = None) -> list[dict]:
+    """GitHub 仓库搜索（对齐 HKUDS search_github_repos：标题关键词 + stars 排序）。
+
+    无 token 走匿名限额（10 次/分），够创新点场景；失败返回空列表（视为无开源）。
+    """
+    import urllib.parse
+    import urllib.request
+
+    q = urllib.parse.quote(f"{query} in:name,description")
+    url = f"https://api.github.com/search/repositories?q={q}&sort=stars&order=desc&per_page=10"
+    req = urllib.request.Request(url, headers={
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "ResearcherAgent",
+    })
+    if token:
+        req.add_header("Authorization", f"Bearer {token}")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            data = json.loads(r.read().decode("utf-8"))
+    except Exception:
+        return []
+    out = []
+    for item in (data.get("items") or [])[:limit]:
+        out.append({
+            "name": f"{item['owner']['login']}/{item['name']}",
+            "stars": item.get("stargazers_count", 0),
+            "url": item.get("html_url", ""),
+            "clone_url": item.get("clone_url", ""),
+            "description": (item.get("description") or "")[:120],
+            "language": item.get("language"),
+        })
+    return out
+
+
+def _github_fetch_py_files(owner: str, repo: str, max_files: int = 12,
+                          token: str | None = None) -> dict[str, str]:
+    """GitHub Contents API 拉取关键 .py 文件（git clone 不可达时的降级通道）。
+
+    用 git/trees/HEAD?recursive=1 一次拿全树 → 启发式挑关键 .py → contents API 逐个拉内容。
+    返回 {相对路径: 源码}；失败或无可拉文件返回空 dict。
+    """
+    import base64
+    import urllib.parse
+    import urllib.request
+
+    def _gh(url: str) -> dict | None:
+        req = urllib.request.Request(url, headers={
+            "Accept": "application/vnd.github+json", "User-Agent": "ResearcherAgent"})
+        if token:
+            req.add_header("Authorization", f"Bearer {token}")
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return json.loads(r.read().decode("utf-8"))
+        except Exception:
+            return None
+
+    tree = _gh(f"https://api.github.com/repos/{owner}/{repo}/git/trees/HEAD?recursive=1")
+    if not tree or not tree.get("tree"):
+        return {}
+    paths = [t.get("path", "") for t in tree["tree"]
+             if t.get("type") == "blob" and t.get("path", "").endswith(".py")]
+    if not paths:
+        return {}
+    # 启发式挑关键实现文件（同 _pick_code_files 打分）
+    keys = ("main", "run", "model", "train", "test", "data", "utils", "module", "network")
+    def _score(p: str):
+        pl = p.lower()
+        s = sum(1 for k in keys if k in pl)
+        if pl.endswith("__init__.py") or "/tests/" in pl or pl.startswith("tests/"):
+            s -= 2
+        if "/experiments/" in pl or "/configs/" in pl:
+            s -= 1
+        return s
+    chosen = sorted(paths, key=lambda p: (-_score(p), len(p)))[:max_files]
+    out: dict[str, str] = {}
+    for p in chosen:
+        data = _gh(f"https://api.github.com/repos/{owner}/{repo}/contents/{urllib.parse.quote(p)}")
+        if not data or not data.get("content"):
+            continue
+        try:
+            out[p] = base64.b64decode(data["content"]).decode("utf-8", errors="replace")
+        except Exception:
+            continue
+    return out
+
+
+def _fetch_reference_repo(clone_url: str, owner: str, repo: str, dest: str,
+                          token: str | None = None) -> str:
+    """拉取参考仓库到沙箱；返回 'git'（git clone）/ 'api'（API 拉关键文件）/ 'CLONE_FAIL: ...'。"""
+    # 通道 A：git clone（网络可达时最完整）
+    out = ce.execute_command.invoke(
+        {"command": f"git clone --depth 1 --single-branch {clone_url} {dest}"})
+    if "Exit code: 0" in out:
+        return "git"
+    # 通道 B：GitHub Contents API 拉关键 .py（api.github.com 通常可达）
+    files = _github_fetch_py_files(owner, repo, token=token)
+    if files:
+        n_ok = 0
+        for rel, content in files.items():
+            try:
+                ce.write_file.invoke({"path": f"{dest}/{rel}", "content": content})
+                n_ok += 1
+            except Exception:
+                pass
+        if n_ok:
+            return f"api({n_ok} files)"
+    return f"CLONE_FAIL: git={out[:120]}"
+
+
+def make_prepare_reference_repos(llm):
+    @tool
+    def prepare_reference_repos(
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        state: Annotated[dict, InjectedState],
+        max_repos_per_paper: int = 2,
+    ) -> Command:
+        """按论文标题搜索 GitHub 开源实现并浅克隆到沙箱（对齐 AI-Researcher Prepare Agent）。
+
+        适用：deep_survey 之后调用。对每篇论文卡标题调 GitHub Search API，
+        按 stars 选 top-N 仓库，浅克隆到工作区 reference_repos/{owner}__{name}。
+        结果写入 state.reference_repos（论文标题 → 仓库列表，含本地路径与 cloned 状态）。
+        论文无开源实现（搜索无结果/克隆失败）时该论文标注 no_open_source，
+        后续 code_survey 将回退本地参考库（LLM 自行生成实现路线）。
+        """
+        cards = state.get("paper_cards") or []
+        titles = [c.get("title", "").strip() for c in cards if c.get("title")]
+        if not titles:
+            return Command(update={"messages": [ToolMessage(
+                content="paper_cards 为空：请先调用 read_papers 精读论文制卡，再准备参考仓库。",
+                tool_call_id=tool_call_id, status="error")]})
+        token = (os.environ.get("GITHUB_TOKEN") or os.environ.get("GITHUB_AI_TOKEN") or None)
+        refs = dict(state.get("reference_repos") or {})
+        lines = [f"参考代码库准备完成（{len(titles)} 篇论文，GitHub 检索 + 浅克隆）："]
+        for title in titles:
+            entry = []
+            card = next((c for c in cards if (c.get("title") or "").strip() == title), None)
+            code_url = ((card or {}).get("code_url") or "").strip()
+            parsed = _parse_github_url(code_url) if code_url else None
+            # ① 论文标注的代码链接最权威，优先拉取
+            if parsed:
+                owner, repo_name = parsed
+                dest = f"reference_repos/{owner}__{repo_name}"
+                mode = _fetch_reference_repo(f"https://github.com/{owner}/{repo_name}.git",
+                                             owner, repo_name, dest, token)
+                ok = not mode.startswith("CLONE_FAIL")
+                entry.append({"name": f"{owner}/{repo_name}", "stars": 0,
+                              "url": f"https://github.com/{owner}/{repo_name}",
+                              "clone_url": f"https://github.com/{owner}/{repo_name}.git",
+                              "description": "论文标注代码链接", "language": "",
+                              "source": "paper_code_url",
+                              "local_path": dest if ok else "", "cloned": ok,
+                              "fetch_mode": mode if ok else ""})
+                if ok:
+                    lines.append(f"• 《{title[:36]}》→ 论文标注 {owner}/{repo_name} 已就绪（{mode}）→ {dest}")
+                else:
+                    lines.append(f"• 《{title[:36]}》→ 论文标注 {owner}/{repo_name} ⚠️ 拉取失败："
+                                 f"{mode[11:120]}，改试 GitHub 搜索兜底…")
+            # ② 无标注链接 / 链接拉取失败 → 标题搜索（stars 排序）兜底
+            if not entry or not entry[0].get("cloned"):
+                repos = _github_search_repos(title, max_repos_per_paper, token)
+                for r in repos:
+                    if not r.get("clone_url"):
+                        continue
+                    dest = f"reference_repos/{r['name'].replace('/', '__')}"
+                    owner, repo_name = r["name"].split("/", 1)
+                    mode = _fetch_reference_repo(r["clone_url"], owner, repo_name, dest, token)
+                    ok = not mode.startswith("CLONE_FAIL")
+                    entry.append({**r, "source": "github_search",
+                                  "local_path": dest if ok else "", "cloned": ok,
+                                  "fetch_mode": mode if ok else ""})
+                    if ok:
+                        lines.append(f"• 《{title[:36]}》→ 搜索 {r['name']} ⭐{r['stars']} "
+                                     f"已就绪（{mode}）→ {dest}")
+                    else:
+                        lines.append(f"• 《{title[:36]}》→ 搜索 {r['name']} ⚠️ 拉取失败：{mode[11:120]}")
+            if not entry or not any(e.get("cloned") for e in entry):
+                lines.append(f"• 《{title[:36]}》→ ⚠️ 未找到开源实现（no_open_source，"
+                             "将回退本地参考库并由 LLM 生成）")
+            refs[title] = entry
+        lines.append("")
+        lines.append("👉 下一步：调用 code_survey 时优先读这些开源仓库；"
+                     "无开源实现的论文回退本地参考库 project/（LLM 生成路线）。")
+        return Command(update={
+            "reference_repos": refs,
+            "messages": [ToolMessage(content="\n".join(lines), tool_call_id=tool_call_id)],
+        })
+
+    return prepare_reference_repos
+
+
+def make_code_survey(llm):
+    @tool
+    def code_survey(
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        state: Annotated[dict, InjectedState],
+        innovation_ids: str | None = None,
+        reference_dir: str = "project",
+        max_files: int = _CODE_SURVEY_MAX_FILES,
+    ) -> Command:
+        """参考代码库调查：读取工作区内的参考实现，生成每个创新点的实现报告。
+
+        适用：propose_innovations + novelty_check 之后、implement_innovation 之前。
+        innovation_ids：逗号分隔的创新点 id（缺省=全部）；reference_dir：参考代码库目录
+        （相对工作区根，默认 project/，含基线实现）。输出写入 state.code_survey_reports，
+        implement_innovation 会注入对应报告。
+        """
+        innovs = state.get("innovations") or []
+        if not innovs:
+            return Command(update={"messages": [ToolMessage(
+                content="innovations 为空：请先调用 propose_innovations 提出创新点。",
+                tool_call_id=tool_call_id, status="error")]})
+        targets = innovs
+        if innovation_ids:
+            ids = {s.strip() for s in innovation_ids.split(",") if s.strip()}
+            targets = [d for d in innovs if d.get("id") in ids]
+        if not targets:
+            return Command(update={"messages": [ToolMessage(
+                content=f"未找到 innovation_ids={innovation_ids} 对应的创新点。",
+                tool_call_id=tool_call_id, status="error")]})
+
+        # 参考目录解析：优先 prepare_reference_repos 克隆的开源仓库，回退本地参考库（LLM 生成路线）
+        ref_repos = state.get("reference_repos") or {}
+        ref_dirs, src_notes = [], []
+        for title, entry in ref_repos.items():
+            for r in entry:
+                if r.get("cloned") and r.get("local_path"):
+                    ref_dirs.append(r["local_path"])
+                    src_notes.append(f"《{title[:30]}》开源仓库 {r['name']}")
+        if not ref_dirs:
+            ref_dirs = [reference_dir]
+            src_notes = [f"本地参考库 {reference_dir}/（论文未开源或无克隆，回退 LLM 自行生成路线）"]
+
+        code_bundle, seen_dirs = [], set()
+        for rd in ref_dirs:
+            if rd in seen_dirs:
+                continue
+            seen_dirs.add(rd)
+            tree = ce.gen_code_tree_structure.invoke({"directory": rd})
+            files = _pick_code_files(tree, rd, max_files)
+            for f in files:
+                content = ce.read_file.invoke({"file_path": f"{rd}/{f}"})
+                if content.startswith("Error reading file"):
+                    continue
+                code_bundle.append(f"===== {rd}/{f} =====\n{content[:_CODE_SURVEY_CHARS]}")
+        if not code_bundle:
+            return Command(update={"messages": [ToolMessage(
+                content=(f"参考代码库（{'、'.join(ref_dirs) or reference_dir}）未读到可用 .py 文件"
+                         f"（tree 输出：\n{tree[:500]}）。请确认目录存在，"
+                         "或改用 code_exec 的 list_files 查看工作区。"),
+                tool_call_id=tool_call_id, status="error")]})
+
+        brief = []
+        for i, d in enumerate(targets, 1):
+            brief.append(f"[{i}] id={d.get('id')} 名称={d.get('name','')}\n"
+                         f"    方法={d.get('method','')[:250]}\n"
+                         f"    公式={d.get('math_formula','')[:150]}")
+        notes = state.get("survey_notes") or []
+        notes_txt = ("\n【深度调研笔记】\n" + json.dumps(notes, ensure_ascii=False)[:3000]) if notes else ""
+        sys = (
+            "你是资深代码评审工程师。给定创新点与参考代码库内容，输出每个创新点的**实现报告**：\n"
+            "1) 关键机制清单：把创新点的核心机制拆成 2-4 个可实现要点；\n"
+            "2) 每个要点：参考代码中**可复用**的具体实现（类/函数名 + 如何复用 + 所在文件），"
+            "以及**需新增/修改**的部分（含关键张量形状/公式对应代码）。\n"
+            "3) 明确标注哪些机制参考代码**没有现成实现**（需从零写）。\n"
+            "4) 只输出一个 JSON 数组，元素字段：\n"
+            '   [{"innovation_id": "inn_01", "report": "完整实现报告（含可复用清单与需新增清单）"}]'
+        )
+        user = ("创新点：\n" + "\n".join(brief) + notes_txt +
+                "\n\n参考代码来源：" + "；".join(src_notes) +
+                "\n参考代码库内容：\n" + "\n".join(code_bundle))
+        with tracing.span("llm", "code_survey", state.get("session_id", "")):
+            resp = llm.invoke([SystemMessage(content=sys), HumanMessage(content=user)])
+        data = _extract_json_block(resp.content if hasattr(resp, "content") else str(resp))
+        if not isinstance(data, list) or not data:
+            return Command(update={"messages": [ToolMessage(
+                content="模型未返回有效实现报告 JSON，请重试。",
+                tool_call_id=tool_call_id, status="error")]})
+        reports = dict(state.get("code_survey_reports") or {})
+        for r in data:
+            if isinstance(r, dict) and r.get("innovation_id"):
+                reports[r["innovation_id"]] = r.get("report", "")
+        lines = [f"实现报告完成（{len(data)} 个创新点）："]
+        for r in data:
+            if isinstance(r, dict):
+                rid = r.get("innovation_id", "?")
+                rep_txt = (r.get("report") or "")[:120].replace("\n", " ")
+                lines.append(f"• {rid}: {rep_txt}...")
+        lines.append("")
+        lines.append("👉 下一步：调用 implement_innovation 实现实验（报告会自动注入 prompt，"
+                     "LLM 将优先复用参考代码）。")
+        return Command(update={
+            "code_survey_reports": reports,
+            "messages": [ToolMessage(content="\n".join(lines), tool_call_id=tool_call_id)],
+        })
+
+    return code_survey
+
+
+# ---------------------------------------------------------------------------
+# 4. novelty_check —— 创新点新颖性查重（AI-Scientist Novelty Check 轻量版）
 #     verdict=duplicate 的创新点标记 status='duplicate'，implement_innovation 拒绝为其跑实验。
 # ---------------------------------------------------------------------------
 _NOVELTY_SOURCES = ("search_openalex", "search_europepmc", "search_crossref", "search_arxiv")
@@ -456,7 +935,7 @@ async def _mcp_search_papers(queries: dict, per_query: int = _NOVELTY_HIT_MAX) -
     """按 {id: [query, ...]} 检索白名单 4 源，返回 {id: [命中论文 dict, ...]}（去重、截断）。"""
     from langchain_mcp_adapters.client import MultiServerMCPClient
     from langchain_mcp_adapters.tools import load_mcp_tools
-    from agent.core.config import MCP_CONFIG
+    from ResearcherAgent.core.config import MCP_CONFIG
 
     tools: dict = {}
     try:
@@ -471,7 +950,7 @@ async def _mcp_search_papers(queries: dict, per_query: int = _NOVELTY_HIT_MAX) -
         print("--> [novelty] 白名单检索工具为空（MCP 加载失败）")
         return {}
 
-    from agent.tools.agent_tools import parse_papers
+    from ResearcherAgent.tools.agent_tools import parse_papers
     sem = asyncio.Semaphore(3)
 
     async def _one(tool, query: str) -> list[dict]:
@@ -753,11 +1232,18 @@ def make_implement_innovation(llm):
             "7) 已知踩坑经验（避免重犯；与本创新点无关可忽略）：\n"
             f"{exp_ctx or '（暂无）'}"
         )
+        cs_reports = state.get("code_survey_reports") or {}
+        cs_hint = ""
+        if cs_reports.get(innovation_id):
+            cs_hint = (
+                "\n\n【参考代码库实现报告（code_survey 产出，务必优先复用其中指出的可复用实现）】\n"
+                f"{cs_reports[innovation_id][:_CARD_MAX_CHARS * 2]}"
+            )
         user = (
             f"创新点（id={innovation_id}）：\n{json.dumps(innov, ensure_ascii=False, indent=1)}\n\n"
             f"数据集：{dataset}（CSV={data_dir}/ETTh1.csv）\n"
             f"配置：seq_len={seq_len}, pred_len={pred_len}, epochs={epochs}\n"
-            f"{baseline_hint}\n"
+            f"{baseline_hint}{cs_hint}\n"
             f"请直接输出完整 Python 代码。"
         )
         with tracing.span("llm", "implement_innovation", state.get("session_id", ""), id=innovation_id):

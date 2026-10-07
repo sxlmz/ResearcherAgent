@@ -22,8 +22,8 @@ import time
 import urllib.error
 import urllib.request
 
-from agent.core import cache
-from agent.core import tracing
+from ResearcherAgent.core import cache
+from ResearcherAgent.core import tracing
 
 _TIMEOUT = 90          # 全池重排实测 5.9s；留足余量
 _MAX_RETRY = 2

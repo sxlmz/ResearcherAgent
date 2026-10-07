@@ -23,7 +23,7 @@ must_read.py —— 用「种子论文 + 引文网络扩展」自动生成某方
     的数千次。所以只能用于**同一个方向内的排序**，不能当绝对重要性。
 
 用法：
-  python agent/research/must_read.py \
+  python ResearcherAgent/research/must_read.py \
       --seeds "LightGCN: Simplifying and Powering Graph Convolution Network" \
               "Neural Graph Collaborative Filtering" \
               "Graph Neural Networks for Recommender Systems: Challenges, Methods, and Directions" \

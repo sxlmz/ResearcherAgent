@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""agent/core/paths.py —— 仓库根锚点。
+"""ResearcherAgent/core/paths.py —— 仓库根锚点。
 
 只依赖 pathlib，**绝不能 import 本包内其他模块**（会被 core 下任何模块安全引用而不成环）。
 
@@ -11,7 +11,7 @@
 """
 from pathlib import Path
 
-# agent/core/paths.py → agent/core → agent → 仓库根
+# ResearcherAgent/core/paths.py → agent/core → agent → 仓库根
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-assert (REPO_ROOT / "agent" / "__init__.py").exists(), f"REPO_ROOT 推断错误: {REPO_ROOT}"
+assert (REPO_ROOT / "ResearcherAgent" / "__init__.py").exists(), f"REPO_ROOT 推断错误: {REPO_ROOT}"

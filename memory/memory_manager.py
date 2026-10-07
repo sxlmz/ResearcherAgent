@@ -178,7 +178,7 @@ def _load_profiles_from_pg(uid):
     global _pg_store_singleton
     try:
         if _pg_store_singleton is None:
-            from agent.memory.memory_stack import PostgresStore
+            from ResearcherAgent.memory.memory_stack import PostgresStore
             _pg_store_singleton = PostgresStore()
         rows = _pg_store_singleton.get_profiles(uid)
         return rows if rows else []

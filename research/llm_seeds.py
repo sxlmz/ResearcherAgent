@@ -18,8 +18,8 @@ import sys
 import time
 from pathlib import Path
 
-# --- repo-root bootstrap（本模块既被 import，也有 `python agent/tools/llm_seeds.py <主题>` 的 CLI 用法）---
-_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "agent" / "__init__.py").exists())
+# --- repo-root bootstrap（本模块既被 import，也有 `python ResearcherAgent/research/llm_seeds.py <主题>` 的 CLI 用法）---
+_ROOT = next(p for p in Path(__file__).resolve().parents if (p / "ResearcherAgent" / "__init__.py").exists())
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
@@ -28,7 +28,7 @@ sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 import dotenv
 from openai import OpenAI
 
-from agent.core.paths import REPO_ROOT
+from ResearcherAgent.core.paths import REPO_ROOT
 
 CACHE_DIR = Path("logs") / "eval" / "llm_seeds"
 

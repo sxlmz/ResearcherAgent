@@ -27,8 +27,8 @@ def _ensure():
     if not _ENABLED:
         return False
     try:
-        from agent.memory.memory_classifier import make_embed_fn
-        from agent.memory.memory_stack import InfinityStore
+        from ResearcherAgent.memory.memory_classifier import make_embed_fn
+        from ResearcherAgent.memory.memory_stack import InfinityStore
         _embed = make_embed_fn()
         _infinity = InfinityStore()
         return True
@@ -47,7 +47,7 @@ def on_conversation_turn(user_id, session_id, role, content):
     """
     # ① 工作记忆（Redis，本地快，不依赖 embedding）
     try:
-        from agent.memory.memory_stack import RedisWorkingMemory
+        from ResearcherAgent.memory.memory_stack import RedisWorkingMemory
         r = RedisWorkingMemory()
         cur = r.get_working(session_id) or []
         cur.append({"role": role, "content": str(content)[:500]})
@@ -74,9 +74,9 @@ def get_orchestrator():
     """惰性构建并返回全局 MemoryOrchestrator（真实 embedding，带降级兜底）。"""
     global _orch, _orch_stack, _orch_embed
     if _orch is None:
-        from agent.memory.memory_classifier import make_embed_fn
-        from agent.memory.memory_stack import MemoryStack
-        from agent.memory.memory_orchestrator import MemoryOrchestrator
+        from ResearcherAgent.memory.memory_classifier import make_embed_fn
+        from ResearcherAgent.memory.memory_stack import MemoryStack
+        from ResearcherAgent.memory.memory_orchestrator import MemoryOrchestrator
         _orch_embed = make_embed_fn()
         _orch_stack = MemoryStack(embed_fn=_orch_embed)
         _orch = MemoryOrchestrator(_orch_stack, embed_fn=_orch_embed)

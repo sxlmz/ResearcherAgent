@@ -20,7 +20,7 @@ from pathlib import Path
 from datetime import datetime
 from typing import Optional
 
-from agent.memory.memory_manager import _current_user_id
+from ResearcherAgent.memory.memory_manager import _current_user_id
 
 
 # ==========================================
@@ -95,7 +95,7 @@ def save_conversation_turn(session_id: str, role: str, content: str,
 
     # ---- 记忆系统 v2：对话原文镜像写入 Infinity（用户级，跨会话可检索）----
     try:
-        from agent.memory.memory_integration import on_conversation_turn
+        from ResearcherAgent.memory.memory_integration import on_conversation_turn
         uid = _get_user_id()
         if uid is not None:
             on_conversation_turn(uid, session_id, role, content)
@@ -291,7 +291,7 @@ def delete_conversation(thread_id: str) -> dict:
 
     # 2. 记忆系统 v2：Infinity 对话原文 + Redis 工作记忆（best-effort）
     try:
-        from agent.memory.memory_integration import delete_session_data
+        from ResearcherAgent.memory.memory_integration import delete_session_data
         delete_session_data(_get_user_id(), thread_id)
         report["memories_deleted"] = True
     except Exception as e:
@@ -299,7 +299,7 @@ def delete_conversation(thread_id: str) -> dict:
 
     # 2b. PostgreSQL conversations 索引行
     try:
-        from agent.memory.memory_stack import PostgresStore
+        from ResearcherAgent.memory.memory_stack import PostgresStore
         cur = PostgresStore()._cur()
         cur.execute("DELETE FROM conversations WHERE thread_id=%s", (thread_id,))
     except Exception:
