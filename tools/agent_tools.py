@@ -7,10 +7,10 @@ agent_tools.py
 |------------------------------------|---------------------------|
 | plan_review                        | make_outline              |
 | 检索指令 + chatbot_with_tools       | MCP 搜索工具（包装后入 paper_pool，只回摘要给模型） |
-| coverage_judge + route_after_coverage | check_coverage（是否补搜由模型决定） |
+| coverage_judge + route_after_coverage | —（v1.2.7 删除：大纲定节已保证每节 ≥5 篇有全文，read_sections 内嵌全池重排） |
 | targeted_search                    | —（模型直接再调搜索工具）    |
-| deep_read                          | read_papers               |
-| review_materials + interrupt       | ask_user                  |
+| deep_read                          | read_papers / read_sections |
+| review_materials + interrupt       | —（v1.2.7 删除：全部卡片直接用，无用户审核门） |
 | （新）显式计划                       | write_todos               |
 
 设计原则（Anthropic《Building Effective Agents》）：
@@ -34,17 +34,14 @@ from langgraph.types import Command, interrupt
 from pydantic import BaseModel, Field
 
 from ResearcherAgent.core.config import (
-    TOOL_CONCURRENCY, MAX_TOOL_RESULT_CHARS, MAX_SEARCH_ROUNDS,
+    TOOL_CONCURRENCY, DOWNLOAD_CONCURRENCY, EXTRACT_CONCURRENCY, MAX_TOOL_RESULT_CHARS, MAX_SEARCH_ROUNDS,
     PAPER_SEARCH_TOOL_WHITELIST, WEB_SEARCH_TOOL_PREFIXES,
-    SECTION_CANDIDATES_K, RERANK_MIN_SCORE, CARDS_PER_SECTION,
+    SECTION_CANDIDATES_K, RERANK_MIN_SCORE, RERANK_MIN_CAND_SCORE, MIN_PAPERS_PER_SECTION, CARDS_PER_SECTION,
     SRC_FAIL_STREAK, SRC_COOLDOWN_SEC, MCP_CALL_TIMEOUT_SEC, RETRY_BACKOFF_SEC,
 )
 from ResearcherAgent.core import cache
 from ResearcherAgent.core import tracing
 
-from ResearcherAgent.research import llm_seeds
-from ResearcherAgent.research import must_read as mr
-from ResearcherAgent.research import discover_directions as dd
 from ResearcherAgent.retrieval import retrieval_cache as rcache
 
 
@@ -54,13 +51,13 @@ from ResearcherAgent.retrieval import retrieval_cache as rcache
 
 def paper_key(p: dict) -> str:
     """去重键：doi > paper_id > 归一化标题。"""
-    doi = (p.get("doi") or "").strip().lower()
+    doi = str(p.get("doi") or "").strip().lower()
     if doi:
         return "doi:" + doi
-    pid = (p.get("paper_id") or p.get("id") or "").strip().lower()
+    pid = str(p.get("paper_id") or p.get("id") or p.get("paperId") or "").strip().lower()
     if pid:
         return "id:" + pid
-    title = re.sub(r"[^a-z0-9一-鿿]+", " ", (p.get("title") or "").lower()).strip()
+    title = re.sub(r"[^a-z0-9一-鿿]+", " ", str(p.get("title") or "").lower()).strip()
     return "title:" + " ".join(title.split()[:12])
 
 
@@ -148,8 +145,20 @@ def merge_papers(left: list | None, right: list | None) -> list:
 def parse_papers(raw: Any, source_hint: str = "") -> list[dict]:
     """把 MCP 检索工具的返回（JSON 文本 / 文本块列表 / dict 列表）解析成论文 dict 列表。
 
+    v1.2.5：解析出的每条论文统一附加 `fulltext_hint` 字段（arxiv:<id> / pmc:<PMCID> /
+    oa:<url> / ""）——全文可得性在**检索建池阶段**就确定，供 make_outline 定节、
+    覆盖度统计、read_sections 选卡直接使用，不再等到精读阶段才暴露。
     解析不了的内容退化为一条 {"title": <首行>, "raw": <全文>} blob，绝不丢信息。
     """
+    items = _parse_papers_items(raw, source_hint)
+    for p in items:
+        if isinstance(p, dict) and not p.get("fulltext_hint"):
+            p["fulltext_hint"] = _paper_id_for_fulltext(p)
+    return items
+
+
+def _parse_papers_items(raw: Any, source_hint: str = "") -> list[dict]:
+    """parse_papers 的内部实现（只解析，不附加 fulltext_hint）。"""
     items: list = []
     if isinstance(raw, list):
         for it in raw:
@@ -163,6 +172,9 @@ def parse_papers(raw: Any, source_hint: str = "") -> list[dict]:
     if isinstance(raw, dict):
         if "papers" in raw and isinstance(raw["papers"], list):
             return parse_papers(raw["papers"], source_hint)
+        # Semantic Scholar MCP（semantic-scholar-mcp）返回 {"data": [...], "total":..., ...}
+        if "data" in raw and isinstance(raw["data"], list):
+            return parse_papers(raw["data"], source_hint)
         return [raw]
     text = str(raw or "").strip()
     if not text:
@@ -235,8 +247,8 @@ def _fingerprint(obj) -> str:
 
 def paper_rerank_text(p: dict) -> str:
     """构造用于重排的文本：标题 + 摘要前 400 字（与 render_paper 给模型看的内容一致）。"""
-    title = (p.get("title") or "").strip()
-    ab = _clean_text(p.get("abstract") or p.get("raw") or "")[:400]
+    title = str(p.get("title") or "").strip()
+    ab = _clean_text(str(p.get("abstract") or p.get("raw") or ""))[:400]
     return (f"{title}. {ab}".strip())[:600]
 
 
@@ -259,31 +271,37 @@ def select_section_candidates(pool: list, outline: list, k: int = SECTION_CANDID
                               thread_id: str = "") -> dict:
     """对每个章节做**全池重排**，取 top-K 作为该节候选。
 
-    这是「宽召回 → 精确重排 → 少量进 prompt」里的第二级。相比旧做法（按「有没有摘要」排序），
-    重排直接回答「这篇和这一节有多相关」，且视野是**全池**而非 26 篇。
+    v1.2.4「先筛全文再精排」：重排池 = **有全文可达线索**的论文（arXiv/PMC id 或 OA URL），
+    无任何全文线索的题录不参与重排/覆盖度统计——防止精排 top 选中后取不到全文，
+    导致 read_sections 后续步骤失效；它们仍在 paper_pool，写作时可作「未精读·仅摘要」引用。
 
     返回 {section: {"query":..., "candidates":[{idx,key,score,title,has_abstract}]}}；
     重排 API 不可用时返回 {}（调用方自动降级回旧排序）。
     """
     from ResearcherAgent.retrieval import rerank as _rerank
     pool = [p for p in (pool or []) if isinstance(p, dict)]
-    if not pool or not outline or not _rerank.available():
-        if pool and outline and not _rerank.available():
+    pool_ft = [p for p in pool if _paper_id_for_fulltext(p)]
+    if not pool_ft:
+        print(f"    ℹ️ [rerank] 池内 {len(pool)} 篇均无全文可达线索（arXiv/PMC/OA），"
+              f"跳过重排——请换可开放获取的检索源")
+        return {}
+    if not outline or not _rerank.available():
+        if pool_ft and outline and not _rerank.available():
             print("    ℹ️ [rerank] 未配置 RERANK_API_*，跳过重排（降级为按素材可用性排序）")
         return {}
 
     # ---- L5 缓存：同样的（池 + 大纲）不重复重排 ----
-    pool_fp = _fingerprint(sorted(paper_key(p) for p in pool))
+    pool_fp = _fingerprint(sorted(paper_key(p) for p in pool_ft))
     outline_fp = _fingerprint([f"{o.get('section')}|{o.get('focus')}|{o.get('queries')}"
                                for o in outline])
     hit = cache.select_get(pool_fp, outline_fp)
     if hit:
-        print(f"--> [Rerank] ♻️ L5 选材缓存命中（池 {len(pool)} 篇 × {len(outline)} 节），"
+        print(f"--> [Rerank] ♻️ L5 选材缓存命中（池 {len(pool_ft)} 篇 × {len(outline)} 节），"
               f"跳过 {len(outline)} 次全池重排")
         return hit
 
-    gidx = global_index(pool)
-    docs = [paper_rerank_text(p) for p in pool]
+    gidx = global_index(pool_ft)
+    docs = [paper_rerank_text(p) for p in pool_ft]
     out: dict = {}
     for o in outline:
         sec = str(o.get("section") or "").strip()
@@ -294,13 +312,18 @@ def select_section_candidates(pool: list, outline: list, k: int = SECTION_CANDID
         res = _rerank.rerank(q, docs, thread_id=thread_id)   # 不传 top_n → 返回全部分数
         if not res:
             continue
-        # 覆盖度：统计全池里有多少篇达到阈值（这才是「这一节资料够不够」）
+        # 覆盖度：统计有全文线索的池里有多少篇达到阈值（这才是「这一节能精读的资料够不够」）
         n_rel = sum(1 for _, s in res if s >= RERANK_MIN_SCORE)
         cands = []
         for i, score in res[:k]:
-            if not (0 <= i < len(pool)):
+            # v1.2.11 候选过滤：低于 RERANK_MIN_CAND_SCORE 直接丢弃——
+            # 低分论文语义上与本节不匹配，精读了只会造成「章节标题与内容对不上」
+            # （coverage_gap / 内容深度低）。宁可少精读，也不塞不相关论文。
+            if score < RERANK_MIN_CAND_SCORE:
                 continue
-            p = pool[i]
+            if not (0 <= i < len(pool_ft)):
+                continue
+            p = pool_ft[i]
             cands.append({"idx": gidx.get(paper_key(p)), "key": paper_key(p),
                           "score": round(float(score), 4),
                           "title": (p.get("title") or "")[:120],
@@ -310,8 +333,9 @@ def select_section_candidates(pool: list, outline: list, k: int = SECTION_CANDID
         out[sec] = {"query": q[:120], "candidates": cands,
                     "top_score": top, "n_relevant": n_rel,
                     "scored_total": len(res)}
-        print(f"--> [Rerank] 「{sec[:24]}」全池 {len(res)} 篇打分，"
-              f"≥{RERANK_MIN_SCORE} 的 {n_rel} 篇；取 top-{len(cands)} 作候选（最高 {top:.3f}）")
+        print(f"--> [Rerank] 「{sec[:24]}」有全文池 {len(pool_ft)} 篇打分，"
+              f"≥{RERANK_MIN_SCORE} 的 {n_rel} 篇；≥{RERANK_MIN_CAND_SCORE} 过滤后取 "
+              f"{len(cands)} 篇作候选（最高 {top:.3f}）")
     if out:
         cache.select_set(pool_fp, outline_fp, out)
     return out
@@ -321,18 +345,16 @@ def per_section_top_cards(cands: dict, per_section: int = CARDS_PER_SECTION,
                           prefer_readable: bool = True) -> list:
     """从每节候选中挑出要精读的论文（默认每节 top-2）。
 
-    优先挑**能取到结构化全文**的（有 arXiv/PMC id）——否则 read_papers 拿不到正文。
-    如果没有可读 id 的，退回按分数取，让 read_papers 去尝试。
+    v1.2.4：**只挑有全文 id 的候选**（arXiv/PMC/OA）——无全文线索的不选
+    （宁缺毋滥，read_sections 会对下载失败的自动补位）。
     """
     picks = []
     for sec, info in (cands or {}).items():
         cs = list(info.get("candidates") or [])
         if prefer_readable:
-            # ⚠️ 只在**靠前的候选**里挑可读的：若为了「有 arXiv id」一路往下捞到第 12 名，
-            # 就把一篇相关性很低的论文塞进了精读——相关性优先于可读性，读不到就跳过。
+            # 窗口内只取有 readable_id 的：相关性优先于可读性，但**无全文线索的不选**
             window = cs[:max(per_section * 3, 5)]
-            readable = [c for c in window if c.get("readable_id")]
-            chosen = readable[:per_section] if readable else window[:per_section]
+            chosen = [c for c in window if c.get("readable_id")][:per_section]
         else:
             chosen = cs[:per_section]
         for c in chosen:
@@ -424,7 +446,7 @@ def pool_budget_stats(pool: list, section: str | None = None, max_chars: int = 1
     section_total / section_with_abstract 统计**归属该节**的论文，优先用 LLM 本次判定
     给出的 paper_idx（1-based），其次退回 pool 里的 sections 归属字段。
 
-    ⚠️ 为什么不只用 sections 字段：归属是 check_coverage **自己**的产物，第一次调用时
+    ⚠️ 为什么不只用 sections 字段：归属是重排/大纲**自己**的产物，第一次调用时
     pool 里还没有任何归属信息，全部会算成 0/0，导致收尾判据误报「全部章节未达标」。
     """
     pool = [p for p in (pool or []) if isinstance(p, dict)]
@@ -588,6 +610,34 @@ def _norm_card_title(t: str) -> str:
     return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", s)
 
 
+def _render_unread_line(p: dict, idx: int | None = None) -> str:
+    """未精读论文的写作材料行：作者 + 标题 + 方法提示（摘要首句）。
+
+    设计（2026-10 用户决策）：未精读论文统一按「XX等人提出了XXX，通过XXX方法
+    解决XXX」一句话提及，**不展开实验数据/数字结论**——所以这里刻意不渲染摘要
+    中的实验数据，只留方法提示，杜绝 writer 引用未读论文的数字。
+
+    保留编号 `[N]`：综述引用池内未精读论文是正常学术实践（摘要级引用）；
+    评审侧把这类引用标记为**摘要级弱证据**进低置信清单交用户审核，而不是砍编号。
+    """
+    head = f"[{idx}] " if idx is not None else ""
+    title = p.get("title") or "(无标题)"
+    meta = []
+    if p.get("authors"):
+        meta.append(str(p["authors"])[:60])
+    if p.get("published_date"):
+        meta.append(str(p["published_date"])[:4])
+    ab = _clean_text(p.get("abstract") or p.get("raw") or "")
+    first = ""
+    if ab:
+        first = re.split(r"[。．.!?；;]", ab)[0].strip()
+    line = f"{head}{title}" + (f"（{' · '.join(meta)}）" if meta else "")
+    line += "【未精读·仅摘要】"
+    if first:
+        line += f"\n    方法提示（摘要首句）：{first[:150]}"
+    return line
+
+
 def render_section_candidates(pool: list, cands: dict, section: str,
                               max_chars: int = 15000, card_only: bool = False,
                               cards: list | None = None) -> str:
@@ -597,46 +647,61 @@ def render_section_candidates(pool: list, cands: dict, section: str,
     本节之外的补充材料与本节无关；现在补充材料也是**针对本节重排出来的高分论文**。
 
     ⚠️ 编号必须用 global_index —— 正文的 `[N]` 要能映射回真实论文才能拼参考表。
-    候选不足或重排不可用时退回 render_pool。
 
-    card_only=True（证据约束）：只渲染**有精读卡片**的论文，卡片全文一并注入，
-    杜绝写作引用「只见过摘要/没读过」的论文（忠实度升级）。
+    card_only=True（证据约束，2026-10 升级为**分级材料**）：
+      · **精读卡论文**：卡片全文一并注入 → 可编号引用、可扩展（方法/实验数据/局限）
+      · **未精读论文**（该节候选里没有卡片）：仅作者+方法提示行 → 只能按
+        「XX等人提出了XXX，通过XXX解决XXX」一句话提及，禁止展开实验数据
+      · 该节无候选（引言/结论等 section="" 场景）→ 退化为「全部卡片论文」，
+        **不再回退到全池摘要渲染**（旧实现会放行无卡片论文 → writer 敢引 → 评审大砍）
     """
     pool = [p for p in (pool or []) if isinstance(p, dict)]
     info = ((cands or {}).get("sections") or {}).get(section) or {}
     cs = info.get("candidates") or []
-    if not cs:
-        return render_pool(pool, section=section, max_chars=max_chars)
 
     by_key = {paper_key(p): p for p in pool}
     gidx = global_index(pool)
+    card_by_title = {_norm_card_title(c.get("title", "")): c for c in (cards or [])}
+
+    if card_only:
+        ordered = [by_key[c["key"]] for c in cs if c.get("key") in by_key]
+        if not ordered:
+            # 无该节候选（引言/结论 section=""）→ 用全部「有卡片」论文，不分节
+            ordered = [p for p in pool
+                       if _norm_card_title(p.get("title", "")) in card_by_title]
+        if not ordered:
+            return ("（本节暂无精读卡片：请仅基于已有知识综述背景，"
+                    "正文**不要**给出任何引用编号；待补充精读后再写。）")
+        read_parts, unread_parts, total = [], [], 0
+        for p in ordered:
+            _k = _norm_card_title(p.get("title", ""))
+            c = card_by_title.get(_k)
+            if c:
+                s = render_paper(p, gidx.get(paper_key(p)), True)
+                s += f"\n【精读卡片】{c.get('card', '')}"
+                bucket = read_parts
+            else:
+                s = _render_unread_line(p, gidx.get(paper_key(p)))
+                bucket = unread_parts
+            if total + len(s) > max_chars and read_parts:
+                break
+            bucket.append(s)
+            total += len(s) + 1
+        if not read_parts and not unread_parts:
+            return ("（本节材料按证据约束为空：请基于已有知识综述背景，"
+                    "正文**不要**给出任何引用编号；待补充精读后再写。）")
+        head = (f"（本节材料按证据约束分级：{len(read_parts)} 篇精读"
+                f"（带原文证据卡片，可展开方法/实验数据）+ {len(unread_parts)} 篇未精读"
+                f"（仅摘要级：可编号引用，但只能『XX等人提出了XXX，通过XXX解决XXX』"
+                f"一句话提及，禁止展开实验数据））\n")
+        return head + "\n".join(read_parts + unread_parts)
+
+    # ── 非 card_only：按相关性渲染（摘要全量）──
+    if not cs:
+        return render_pool(pool, section=section, max_chars=max_chars)
     ordered = [by_key[c["key"]] for c in cs if c.get("key") in by_key]
     if not ordered:
         return render_pool(pool, section=section, max_chars=max_chars)
-
-    if card_only:
-        # 证据约束：只保留有卡片论文；卡片全文追加到该论文条目后
-        card_by_title = {_norm_card_title(c.get("title", "")): c for c in (cards or [])}
-        _kept = []
-        for p in ordered:
-            _k = _norm_card_title(p.get("title", ""))
-            if _k in card_by_title:
-                _kept.append((p, card_by_title[_k]))
-        if not _kept:
-            return ("（本节暂无精读卡片：请仅基于已有知识综述背景，"
-                    "正文**不要**给出任何引用编号；待补充精读后再写。"
-                    f"本节候选 {len(ordered)} 篇均无卡片）")
-        parts, total = [], 0
-        for p, c in _kept:
-            s = render_paper(p, gidx.get(paper_key(p)), True)
-            s += f"\n【精读卡片】{c.get('card', '')}"
-            if total + len(s) > max_chars:
-                break
-            parts.append(s)
-            total += len(s) + 1
-        head = (f"（本节材料按证据约束：仅 {len(_kept)} 篇已精读论文（含卡片全文））\n")
-        return head + "\n".join(parts) if parts else ""
-
     parts, total, n_items = [], 0, 0
     for p in ordered:
         s = render_paper(p, gidx.get(paper_key(p)), True)
@@ -934,12 +999,105 @@ class OutlineSection(BaseModel):
         description=(
             "2-3 个**英文**检索关键词。**每个关键词都必须带上用户所指的场景/领域限定词**，"
             "不能只写泛化的方法名——实测只写泛方法词会让窄领域检索命中率降为 0。\n"
-            "✗ 反例（太泛，会召回大量无关领域论文）：time series forecasting / "
-            "deep learning recommendation\n"
-            "✓ 正例（含场景限定词）：wind power forecasting / wind speed prediction LSTM / "
-            "SCADA wind turbine time series\n"
+            "✗ 反例（太泛，只写领域最泛的上位方法词，会召回大量无关论文）："
+            "如时序领域的 \"time series forecasting\"（示例，领域变通）\n"
+            "✓ 正例（场景/领域限定词 + 方法）：如时序领域的 \"wind power forecasting\" / "
+            "\"wind speed prediction LSTM\"（示例，领域变通）\n"
             "若用户没指定具体场景，则用主题里最有区分度的领域词，不要退化成最泛的上位词。"
         ))
+
+
+def make_survey_evolution(llm):
+    """演进脉络调研工具工厂：Tavily 搜主题演进 → LLM 梳理 3-4 个演进方向 → 存 state。
+
+    综述流程第一步（v1.2.6）：先摸清「该方向是怎么演进的」，再按演进方向定向检索有全文论文，
+    避免大纲凭空列世代、列了没全文支撑的空节。
+    """
+    _SYS = (
+        "你是科研综述策划专家。下面是用 Tavily 网页搜索「{topic}」领域研究演进脉络得到的片段。\n"
+        "请梳理该领域的**演进脉络**，列出 3-4 个演进方向/技术世代（由远及近）。每个方向：\n"
+        "1) name：方向名。示例（**仅示意「世代」的含义，具体领域必须变通、严禁照抄**）：\n"
+        "   时序=经典统计方法→深度学习初期（RNN/LSTM）→Transformer 时代→后 Transformer 改进；\n"
+        "   视觉=手工特征/传统方法→CNN→注意力/Transformer→基础模型/扩散等；\n"
+        "   医药=传统统计/评分系统→传统机器学习→深度学习→LLM/多模态等。\n"
+        "2) era：大致时间段（年份区间或描述）。\n"
+        "3) methods：代表性方法 2-4 个。\n"
+        "4) search_queries：2-3 个英文检索词（**必须带领域限定词**，用于定向检索该方向论文，"
+        "不要只写泛方法词：如时序领域写 wind power forecasting 而不是 time series forecasting）。\n"
+        "5) description：一句话说明该方向解决什么问题、有什么局限（供大纲 focus 使用）。\n"
+        "只输出 JSON 数组，不要输出其他任何文字。Tavily 片段不足时基于领域常识补全，"
+        "并在对应 description 末尾标注『（基于常识，待文献验证）』。"
+    )
+
+    @tool
+    async def survey_evolution(
+        tool_call_id: Annotated[str, InjectedToolCallId],
+        state: Annotated[dict, InjectedState],
+    ) -> Command:
+        """演进脉络调研（综述第一步）：Tavily 搜索该主题领域「如何演进」，梳理出 3-4 个演进方向
+        （技术世代）存入 state.evolution_directions。
+
+        ★ **本工具只负责探索演进方向，不要在调用后立即检索论文**（v1.2.13 流程修订）：
+        正确顺序 = survey_evolution（本步）→ make_outline（按方向写大纲，方法论默认 3 节、
+        最多 4 节）→ **按大纲方法节定向检索**（每节 1 个 query，arXiv/EuropePMC/CORE 三源并发，
+        一轮、禁止补检）→ read_sections（精排 + 全文制卡，有全文 <5 篇的节自动删除或并入相邻节）。
+        """
+        from langchain_core.messages import HumanMessage, SystemMessage
+        from ResearcherAgent.retrieval.fulltext import tavily_search
+        from ResearcherAgent.innovate.innovation_tools import _extract_json_block
+
+        topic = state.get("topic") or state.get("user_request") or ""
+        if not topic:
+            return Command(update={"messages": [ToolMessage(
+                content="缺少主题：请先提供研究方向（topic）。", tool_call_id=tool_call_id,
+                status="error")]})
+        # 幂等：已调研过则直接复用，避免重复扣 Tavily 配额
+        if state.get("evolution_directions"):
+            dirs = state["evolution_directions"]
+            names = "、".join(d.get("name", "?") for d in dirs)
+            return Command(update={"messages": [ToolMessage(
+                content=f"演进方向已存在（{names}），无需重复调研；"
+                        "直接调用 make_outline 按这些方向写大纲，再按方法节定向检索。",
+                tool_call_id=tool_call_id)]})
+        hits = tavily_search(f"{topic} research evolution history timeline survey", max_results=8)
+        if not hits:
+            return Command(update={"messages": [ToolMessage(
+                content="Tavily 演进调研失败（网络或配额）。可重试一次；若持续失败，"
+                        "可跳过本步直接 make_outline（按领域惯例写演进式大纲），"
+                        "再按方法节定向检索有全文论文。",
+                tool_call_id=tool_call_id, status="error")]})
+        evidence = "\n".join(
+            f"- {h.get('title', '')}: {h.get('content', '')[:300]}" for h in hits[:6])
+        try:
+            resp = await llm.ainvoke([SystemMessage(content=_SYS.format(topic=topic)),
+                                      HumanMessage(content=evidence)])
+            dirs = _extract_json_block(str(resp.content))
+        except Exception as e:
+            return Command(update={"messages": [ToolMessage(
+                content=f"演进方向梳理失败：{type(e).__name__}: {str(e)[:80]}。可重试或跳过本步。",
+                tool_call_id=tool_call_id, status="error")]})
+        if not isinstance(dirs, list) or not dirs:
+            return Command(update={"messages": [ToolMessage(
+                content="LLM 未返回合法的演进方向 JSON 数组（需 3-4 个对象，每个含 "
+                        "name/era/methods/search_queries/description），请重试。",
+                tool_call_id=tool_call_id, status="error")]})
+        dirs = [d for d in dirs if isinstance(d, dict) and d.get("name")][:4]
+        lines = [f"{i+1}. {d.get('name')}（{d.get('era') or '?'}）："
+                 f"{d.get('description') or ''}｜检索词："
+                 f"{'、'.join(d.get('search_queries') or []) or '（未给检索词）'}"
+                 for i, d in enumerate(dirs)]
+        msg = (f"演进脉络调研完成，共 {len(dirs)} 个演进方向（由远及近）：\n" + "\n".join(lines) +
+               "\n\n下一步：**直接调用 make_outline** 按这些演进方向写大纲（方法论默认 3 节、"
+               "最多 4 节；大纲无需预先检索建池，某方法节检索后有全文论文 <5 篇会在精读时"
+               "自动删除或并入相邻节）。大纲确定后**按每个方法节定向检索一次**"
+               "（每节 1 个 query，arXiv/EuropePMC/CORE 三源并发，一轮、禁止补检），"
+               "然后调用 read_sections 精读制卡。")
+        return Command(update={
+            "evolution_directions": dirs,
+            "messages": [ToolMessage(content=msg, tool_call_id=tool_call_id)],
+        })
+
+    return survey_evolution
 
 
 @tool
@@ -948,10 +1106,37 @@ def make_outline(
     tool_call_id: Annotated[str, InjectedToolCallId],
     state: Annotated[dict, InjectedState],
 ) -> Command:
-    """设定/更新综述大纲（3-6 节）。大纲同时是检索计划和写作结构。
+    """设定/更新综述大纲（5-6 节）。大纲同时是检索计划和写作结构。
+
+    ★ 结构契约（确定性后校验，不满足直接报错让模型重给）：
+    - **节数 5-6**：引言 1 节 + 技术迭代 3-4 节 + 展望总结 1 节；
+      **方法论最好只列三个，除非实在很多，允许有四节大纲**；
+    - **唯一引言**：含「引言」的节只能 1 个，禁止「1 引言」与「1 引言与问题定义」并存；
+    - **唯一展望**：含「展望/结论/总结/未来」的节只能 1 个，且必须有；
+    - **节名去重**：不允许两个同名节。
+
+    ★ 技术迭代节必须按**该领域的技术世代由浅入深**组织（演进式，而非主题罗列）。
+    世代序列**由 LLM 依当前主题领域自适应**，严禁照抄示例：
+    - few-shot 示例（仅示意「世代」的含义，具体领域必须变通）：
+      时序 = 经典统计 → 深度学习初期（RNN/LSTM）→ Transformer → 后 Transformer 改进；
+      视觉 = 手工特征/传统方法 → CNN → 注意力/Transformer → 基础模型/扩散等；
+      医药 = 传统统计/评分系统 → 传统 ML → 深度学习 → LLM/多模态等。
+    - 判断准则：写清「承接上一代解决了什么 + 本代**方法族**与待回答问题
+      （供检索/定向抽取定位）+ 局限引出下一代」；近 2-3 年的最新世代节是
+      「热门研究方向」的证据源，检索时优先保证该节有近 2-3 年文献。
+    - **若 state 里已有 evolution_directions（survey_evolution 的产物），
+      方法节应尽量与其对应**（可合并相近方向，不要无依据另起世代）；
+      若池内某方向有全文论文 <5 篇，删除该节或并入相邻节。
+
+    ★ **大纲基于 survey_evolution 的演进方向定节，不要求预先检索建池（v1.2.13 流程修订）**：
+    论文检索发生在大纲确定之后（按方法节定向检索一轮）。因此：
+    - 大纲直接按演进方向/技术世代组织（由远及近），**不必先攒 paper_pool 再定节**；
+    - 若某方法节检索后有全文论文 <5 篇，read_sections 会自动删除该节或并入相邻节——
+      大纲里可以列出，但**禁止为凑章节预先大规模检索建池**；
+    - 严禁按领域惯例硬列章节——世代划分由 LLM 依当前主题领域自适应（few-shot 引导，变通）。
 
     首次规划时给出完整大纲；用户要求修改时传入**修改后的完整大纲**（保留未提及的章节，
-    只增删/调整用户要求的部分）。调用后覆盖度报告会被清空，需要重新 check_coverage。
+    只增删/调整用户要求的部分）。
 
     ⚠️ **每节的 queries 必须带场景/领域限定词**。这一步决定后续所有检索的质量：
     只写泛方法词（如 time series forecasting）会召回一大堆无关领域的论文，
@@ -963,11 +1148,57 @@ def make_outline(
     if not outline:
         return Command(update={"messages": [ToolMessage(
             content="大纲为空，请至少给出 1 节。", tool_call_id=tool_call_id, status="error")]})
+    # ---- 确定性后校验：演进式结构契约（双引言/缺展望/节数越界/重名 → 报错重给） ----
     names = [o["section"] for o in outline]
+    intro_hits = [n for n in names if "引言" in n]
+    outlook_hits = [n for n in names if any(k in n for k in ("展望", "结论", "总结", "未来"))]
+    dup = {n for n in names if names.count(n) > 1}
+    errs = []
+    if len(intro_hits) != 1:
+        errs.append(f"引言节必须且只能有 1 个（当前 {len(intro_hits)} 个：{intro_hits or '无'}）——"
+                    f"不要同时输出「1 引言」和「1 引言与问题定义」之类的重复节")
+    if len(outlook_hits) != 1:
+        errs.append(f"展望/结论总结节必须有且只有 1 个（当前 {len(outlook_hits)} 个）")
+    if not (5 <= len(names) <= 6):
+        errs.append(f"总节数必须为 5-6 节（引言 1 + 技术迭代 3-4 + 展望 1，当前 {len(names)} 节）——"
+                    "**方法论最好只列三个，除非实在很多，允许有四节大纲**")
+    if dup:
+        errs.append(f"节名重复：{sorted(dup)}——每个技术世代只能对应一节，请合并")
+    if errs:
+        return Command(update={"messages": [ToolMessage(
+            content="大纲不满足演进式结构契约：\n" + "\n".join(f"- {e}" for e in errs)
+                    + "\n\n请按以下结构重新规划（共 5-6 节）：\n"
+                    "1) 引言（1 节，含问题定义/范围/路线图）\n"
+                    "2) 技术迭代 3-4 节（**最好只列三个，除非实在很多，允许有四节大纲**）："
+                    "按**当前主题领域的技术世代由浅入深**——"
+                    "世代序列由你依据该领域自行划分（few-shot：时序=经典统计→RNN/LSTM→Transformer→"
+                    "后Transformer；视觉=手工特征→CNN→注意力→基础模型——仅示例，必须按当前领域变通，"
+                    "严禁照抄）；每节 focus 写清「承接上一代 + 代表方法与机制 + 局限引出下一代」\n"
+                    "3) 展望总结（1 节）",
+            tool_call_id=tool_call_id, status="error")]})
     print(f"--> [Tool:make_outline] {len(outline)} 节: {names}")
-    msg = "大纲已更新（" + "、".join(names) + "）。下一步：按各节 queries 调用检索工具，然后 check_coverage。"
+    # v1.2.4/v1.2.5：返回时给模型"有全文素材分布"提示，让模型审视大纲是否硬列了空节。
+    # v1.2.5 起池内论文在检索建池阶段已过滤为「有全文线索」（fulltext_hint 非空），
+    # 这里统计口径 = 池内全部（fulltext_hint 兜底 _paper_id_for_fulltext 以兼容旧池）。
+    pool = state.get("paper_pool", []) or []
+    ft = [p for p in pool if p.get("fulltext_hint") or _paper_id_for_fulltext(p)]
+    if ft:
+        years = sorted({str(p.get("year") or "") for p in ft if p.get("year")})
+        msg = (f"大纲已更新（" + "、".join(names) + f"）。池内论文 {len(pool)} 篇，"
+               f"其中可获取全文（arXiv/PMC/OA）的 {len(ft)} 篇（年份覆盖 {'–'.join(years[:1] + years[-1:])}）。"
+               f"请确认每个技术迭代节都有 **≥5 篇有全文**论文可支撑（不足 5 篇 → 删除该节或并入相邻节）；"
+               f"若某方向（如经典统计时代）无全文素材，read_sections 会因候选不足自动删除该节"
+               f"或并入相邻节，无需再次调整大纲。\n"
+               f"⚠️ 方法论最好只列三个，除非实在很多，允许有四节大纲。\n"
+               f"⚠️ **每个大纲只检索一轮，禁止任何补检**（补检浪费时间且返回的多是只有摘要的题录）："
+               f"不要调用 search_* 二次检索；某节全文候选不足 5 篇 → read_sections 自动删除/合并该节。"
+               f"直接进入 read_sections 精读（每节 top-10，全池确定性重排，无需 check_coverage）。")
+    else:
+        msg = (f"大纲已更新（" + "、".join(names) + f"）。⚠️ 池内 {len(pool)} 篇论文均无全文可达线索，"
+               f"read_sections 将无法精读制卡——请先换有开放获取的源检索（如 arXiv/Europe PMC），"
+               f"再调用 make_outline 按可精读论文分布重定大纲。")
     return Command(update={
-        "review_outline": outline, "coverage_report": {}, "gaps": [], "selected_papers": [],
+        "review_outline": outline,
         "messages": [ToolMessage(content=msg, tool_call_id=tool_call_id)],
     })
 
@@ -976,181 +1207,6 @@ def make_outline(
 # 2b. 子主题种子检索（LLM 拆子方向 → 代表性论文种子 → 引文网络扩展）
 #     主检索路径：从种子出发做引文扩展，把扩展论文并入 paper_pool。
 # ==========================================
-
-@tool
-def make_subtopics(
-    topic: str = "",
-    tool_call_id: Annotated[str, InjectedToolCallId] = "",
-    state: Annotated[dict, InjectedState] = None,
-) -> Command:
-    """把研究方向拆成 **最多 5 个** 子主题，并为每个子主题给出 1-2 篇代表性论文（种子）。
-
-    子主题覆盖：经典基础方法、主流深度学习方法、近两年热点方向、相邻领域的交叉方法。
-    生成结果存入 state.subtopics，是 expand_seeds 引文扩展的种子来源。
-    拆完后调用 expand_seeds 从这些种子做引文网络扩展，把扩展出的论文并入 paper_pool；
-    无需再按大纲逐节文本检索（search_* 仅作补充最新/偏门文献用）。
-    """
-    topic_ = (topic or "").strip() or (state.get("topic") or state.get("user_request") or "")
-    if not topic_:
-        return Command(update={"messages": [ToolMessage(
-            content="缺少研究方向：请传入 topic 参数，或先确认任务主题。",
-            tool_call_id=tool_call_id, status="error")]})
-    print(f"--> [Tool:make_subtopics] 主题: {topic_[:40]}")
-    try:
-        subtopics = llm_seeds.generate(topic_)
-    except Exception as e:
-        return Command(update={"messages": [ToolMessage(
-            content=f"LLM 拆解子主题失败：{str(e)[:120]}。可稍后重试，或直接用 search_* 检索。",
-            tool_call_id=tool_call_id, status="error")]})
-    if not subtopics:
-        return Command(update={"messages": [ToolMessage(
-            content="LLM 未返回有效子主题，请重试或改用 search_* 检索。",
-            tool_call_id=tool_call_id, status="error")]})
-    seeds = llm_seeds.flatten(subtopics)
-    lines = [f"{i + 1}. {it['subtopic']} → " +
-             "；".join(f"{p['title'][:46]} ({p.get('year')})" for p in it['papers'])
-             for i, it in enumerate(subtopics)]
-    msg = ("已拆解子主题并给出代表性论文（种子）：\n" + "\n".join(lines) +
-           f"\n\n共 {len(subtopics)} 个子主题、{len(seeds)} 篇种子。"
-           "下一步调用 expand_seeds 做引文网络扩展（如需调整种子，可传 seed_titles 覆盖）。")
-    return Command(update={
-        "subtopics": subtopics, "seed_papers": seeds,
-        "coverage_report": {}, "gaps": [], "selected_papers": [],
-        "messages": [ToolMessage(content=msg, tool_call_id=tool_call_id)],
-    })
-
-
-def _oa_abstract(w: dict) -> str:
-    """OpenAlex abstract_inverted_index（倒排词表）→ 可读摘要文本。"""
-    inv = (w.get("abstract_inverted_index") or {})
-    if not inv:
-        return ""
-    pos: dict[int, str] = {}
-    for word, idxs in inv.items():
-        for i in idxs:
-            pos[i] = word
-    return " ".join(pos[i] for i in sorted(pos))[:1500]
-
-
-def _oa_work_to_pool(w: dict, seed_links: int = 0, is_seed: bool = False) -> dict:
-    """OpenAlex 工作记录 → paper_pool 条目（与 MCP 检索结果同构，供去重/渲染/重排复用）。"""
-    src = ((w.get("primary_location") or {}).get("source") or {})
-    return {
-        "title": (w.get("display_name") or "").strip(),
-        "year": w.get("publication_year"),
-        "citations": w.get("cited_by_count") or 0,
-        "abstract": _oa_abstract(w),
-        "url": w.get("id"),
-        "paper_id": mr._wid(w.get("id") or ""),
-        "doi": w.get("doi"),
-        "venue": src.get("display_name") or "",
-        "source": "openalex_expand",
-        "seed_links": seed_links,
-        "is_seed": is_seed,
-        # ★ OA 全文字段（原实现丢弃 → 全文通路永远缺失；实测 Tavily 可提取）
-        "is_oa": bool((w.get("open_access") or {}).get("is_oa")),
-        "oa_url": (w.get("open_access") or {}).get("oa_url") or "",
-        "pdf_url": ((w.get("best_oa_location") or {}).get("pdf_url")
-                    or next((l.get("pdf_url") for l in (w.get("locations") or [])
-                             if l.get("pdf_url")), "")),
-        "landing_url": ((w.get("best_oa_location") or {}).get("landing_page_url") or ""),
-    }
-
-
-@tool
-def expand_seeds(
-    seed_titles: list[str] | None = None,
-    top_n: int = 100,
-    max_candidates: int = 1500,
-    tool_call_id: Annotated[str, InjectedToolCallId] = "",
-    state: Annotated[dict, InjectedState] = None,
-) -> Command:
-    """从代表性论文（种子）出发做**引文网络双向扩展**，把扩展出的论文并入 paper_pool。
-
-    种子默认取 make_subtopics 生成的结果；可用 seed_titles 传入自定义标题（与已有种子合并）。
-    扩展：OpenAlex 引文网络（种子引用了谁 + 谁引用了种子），自动去重、按
-    「被几篇种子引用 + 年均被引 + venue 影响力」打分，取 top_n 篇入池（种子本身也入池）。
-    ⚠️ 首次调用可能耗时 30-90 秒（引文网络请求 + 打分）；结果有磁盘缓存，重复调用更快。
-    若某些种子解析置信度低，返回里会列出，请核实标题后重试或换用 search_* 补检索。
-    """
-    top_n = max(int(top_n or 100), 10)
-    max_candidates = max(int(max_candidates or 1500), 200)
-    base_seeds: list[dict] = [dict(s) for s in (state.get("seed_papers") or [])]
-    for tt in (seed_titles or []):
-        s = str(tt or "").strip()
-        if s and not any(str(x.get("title", "")).strip().lower() == s.lower()
-                         for x in base_seeds):
-            base_seeds.append({"title": s})
-    if not base_seeds:
-        return Command(update={"messages": [ToolMessage(
-            content="没有可用的种子：请先调用 make_subtopics 生成子主题与种子，"
-                    "或用 seed_titles 传入论文标题。",
-            tool_call_id=tool_call_id, status="error")]})
-    print(f"--> [Tool:expand_seeds] 种子 {len(base_seeds)} 篇, top_n={top_n}, max_candidates={max_candidates}")
-
-    # ① 解析种子（OpenAlex 标题/DOI/id → 工作记录）
-    try:
-        sr = mr.resolve_seeds(base_seeds)
-    except Exception as e:
-        return Command(update={"messages": [ToolMessage(
-            content=f"种子解析失败：{str(e)[:120]}（OpenAlex 可能限流）。"
-                    "可稍后重试，或改用 search_* 直接检索。",
-            tool_call_id=tool_call_id, status="error")]})
-    resolved = [x for x in sr if x]
-    low_conf = [x for x in resolved if (x.get("match_score") or 0) < 0.6]
-    seed_works = [x["work"] for x in resolved if (x.get("match_score") or 0) >= 0.6]
-    if not seed_works:
-        return Command(update={"messages": [ToolMessage(
-            content="所有种子解析置信度都过低（可能标题不准确），无法扩展。"
-                    "请核实标题后重试。",
-            tool_call_id=tool_call_id, status="error")]})
-    n_fail = len(base_seeds) - len(resolved)
-    n_low = len(resolved) - len(seed_works)
-    print(f"  解析成功 {len(resolved)} / {len(base_seeds)}（低置信 {n_low}，失败 {n_fail}）")
-
-    # ② 引文网络双向扩展 + 去重 + 打分
-    seed_titles_norm = {mr.norm_title(w.get("display_name", "")) for w in seed_works}
-    cand = mr.expand(seed_works, direction="both", max_candidates=max_candidates)
-    items = mr.dedupe(cand, seed_titles_norm)
-    stats = mr.fetch_source_stats(items)
-    items = mr.score(items, time.gmtime().tm_year, stats)
-    ranked = [it for it in items if not it.get("suspect")]
-    ranked.sort(key=lambda x: -x["total"])
-    print(f"  候选 {len(cand)} → 去重 {len(items)} → 打分完成")
-
-    # ③ 种子 + Top-n 扩展 → pool 条目
-    pool_items: list[dict] = [_oa_work_to_pool(w, seed_links=len(seed_works), is_seed=True)
-                              for w in seed_works]
-    pool_items += [_oa_work_to_pool(it["work"], seed_links=len(it.get("seed_links") or []))
-                   for it in ranked[:top_n]]
-
-    # ④ 去重并入池（reducer 会再做一次全局去重；这里先算新增数）
-    existing = {paper_key(p) for p in (state or {}).get("paper_pool", []) or []}
-    new = [p for p in pool_items if paper_key(p) not in existing]
-    dup = len(pool_items) - len(new)
-
-    # ⑤ 回给模型：新增论文标题 + 统计（截断，全量已在 pool）
-    heads = "\n".join(
-        f"  · [{i + 1}] {p.get('title', '')[:60]} ({p.get('year')}, 被引{p.get('citations')})"
-        for i, p in enumerate(new[:12]))
-    note = ""
-    if n_fail:
-        note += f"\n⚠️ 有 {n_fail} 篇种子未解析到（标题可能不准确）：" +                 "、".join(str(x.get("title"))[:40] for x in base_seeds if x not in resolved)
-    if n_low:
-        note += f"\n⚠️ 有 {n_low} 篇种子解析置信度低（未参与扩展）：" +                 "、".join(f"{x['input'][:36]}→{x['work'].get('display_name','')[:36]}"
-                          for x in low_conf)
-    msg = (f"引文扩展完成：种子 {len(seed_works)} 篇 + 扩展 Top-{top_n} 篇 → "
-           f"本次新增入池 {len(new)} 篇（去重 {dup} 篇）；paper_pool 现有 "
-           f"{len(existing) + len(new)} 篇。\n新增论文（前 {len(heads.splitlines())} 条）：\n{heads}{note}")
-    if len(msg) > 1500:
-        msg = msg[:1500] + "\n…（已截断，全量已在 paper_pool）"
-    return Command(update={
-        "paper_pool": pool_items,
-        "messages": [ToolMessage(content=msg, tool_call_id=tool_call_id)],
-    })
-
-
-
 
 class TodoItem(BaseModel):
     task: str = Field(description="任务描述")
@@ -1175,162 +1231,19 @@ def write_todos(
                                                     tool_call_id=tool_call_id)]})
 
 
-def make_check_coverage(llm):
-    """check_coverage：**用 Cross-Encoder 全池重排**做逐节相关性判断。
+def fetch_and_card(items: list, llm, thread_id: str = "", on_card=None,
+                   on_paper=None) -> tuple[list, list]:
+    """并发取结构化全文（**全篇下载**，方案 v1.2）→ **流式**分字段 Map 成卡片。
+    items: [{"id","title","section"}, ...]
 
-    为什么不再靠 LLM 判相关性：旧实现把 render_pool(max_chars=16000) 给 LLM，
-    而 16000 字符只够约 26 篇——池子 500 篇时**只有 5% 被真正判过**。
-    重排模型直接对「章节查询 × 全池论文」打分，视野 100%，而且分数可比较、可复现。
+    v1.2.10 流式化：下载用 as_completed——每篇全文取到**立即**单篇制卡（embedding
+    快），并回调 on_card(card)。read_sections 借此把卡片**边制边送 MQ**（JSON 块
+    提取与后续下载并行，不再等全部制完才启动提取）。
 
-    LLM 仍保留一个作用：从候选中挑出**真正值得精读**的（重排分高 ≠ 内容有价值，
-    可能是综述性文章）。但候选池从「26 篇随机」变成了「每节重排 top-K」。
-    """
-
-    @tool
-    def check_coverage(
-        tool_call_id: Annotated[str, InjectedToolCallId],
-        state: Annotated[dict, InjectedState],
-    ) -> Command:
-        """评估 paper_pool 对大纲各节的覆盖度，并给出每节的**重排候选**。
-
-        做法：对每一节构造查询，把**全池**论文交给 Cross-Encoder 重排，
-        保留 top-K 作为该节候选。报告里给出每节的候选数、相关性分数分布。
-        候选会存入 section_candidates，供 read_sections 精读使用。
-
-        需先 make_outline 并做过检索。看候选数偏少的章节时，由你决定是否换词再检索。
-        """
-        outline = state.get("review_outline", []) or []
-        pool = state.get("paper_pool", []) or []
-        sections = [o["section"] for o in outline]
-        thread_id = state.get("session_id", "")
-        if not sections:
-            return Command(update={"messages": [ToolMessage(
-                content="尚无大纲，请先调用 make_outline。", tool_call_id=tool_call_id, status="error")]})
-        if not pool:
-            report = {s: {"count": 0, "status": "missing"} for s in sections}
-            return Command(update={"coverage_report": report, "gaps": sections, "selected_papers": [],
-                                   "messages": [ToolMessage(content="paper_pool 为空，所有章节 missing，请先检索。",
-                                                            tool_call_id=tool_call_id)]})
-
-        # ---- ① 全池重排：每节 top-K 候选（核心新增）----
-        # 池子没变（篇数相同）就复用上次结果，避免每调一次覆盖度就全量重排 6 次
-        prev = state.get("section_candidates") or {}
-        cached_pool_n = (prev.get("_pool_n") if isinstance(prev, dict) else None)
-        cands = {}
-        if cached_pool_n == len(pool) and prev.get("sections"):
-            cands = prev["sections"]
-            print(f"--> [Rerank] 池内篇数未变（{len(pool)}），复用上轮重排结果")
-        else:
-            print(f"--> [Rerank] 全池重排 {len(pool)} 篇 × {len(sections)} 节 ...")
-            cands = select_section_candidates(pool, outline, thread_id=thread_id)
-            if cands:
-                cands = {"_pool_n": len(pool), "sections": cands}
-
-        # 重排不可用时降级：退回旧的 LLM 判断
-        if not cands.get("sections"):
-            return _check_coverage_llm_fallback(llm, state, tool_call_id, outline, pool, sections)
-
-        sec_cands = cands["sections"]
-
-        # ---- ② 覆盖度：从重排结果确定性推导 ----
-        report, pool_updates, sel_out = {}, [], []
-        _key2p = {paper_key(pp): pp for pp in pool if isinstance(pp, dict)}
-        for s in sections:
-            info = sec_cands.get(s) or {}
-            cs = info.get("candidates") or []
-            n_rel = int(info.get("n_relevant") or 0)
-            status = "missing" if n_rel == 0 else ("thin" if n_rel < 4 else "covered")
-            report[s] = {"count": n_rel, "status": status,
-                         "top_score": round(float(info.get("top_score") or 0), 3),
-                         "candidates": len(cs)}
-            # 回写只为了给论文补上「归属章节」——**必须携带原记录的标识字段**。
-            # ⚠️ 曾只回写 {"title": <候选里被截断到 120 字符的标题>, "section": s}，
-            # 而 merge_papers 按 paper_key 去重：原记录有 doi（键 doi:xxx），回写只有标题
-            # （键 title:xxx）→ 键不同 → 被当成新论文追加，池里出现「同标题，一条有摘要一条没有」。
-            for c in cs:
-                if c.get("key") and c.get("score", 0) >= RERANK_MIN_SCORE:
-                    src = _key2p.get(c["key"])
-                    if src:
-                        pool_updates.append({
-                            **{k: src.get(k) for k in ("title", "doi", "paper_id")},
-                            "section": s})
-
-        gaps = [s for s, v in report.items() if v["status"] == "missing"]
-        thin = [s for s, v in report.items() if v["status"] == "thin"]
-
-        # ---- ③ 每节挑 2 篇作精读候选（优先能取到全文的）----
-        picks = per_section_top_cards(sec_cands, per_section=CARDS_PER_SECTION)
-        sel_out = [{"title": c.get("title", ""), "id": c.get("readable_id", ""),
-                    "source": "", "section": c.get("section", ""), "score": c.get("score")}
-                   for c in picks]
-
-        icon = {"covered": "✅", "thin": "⚠️", "missing": "❌"}
-        lines = [f"覆盖度报告（口径：对**全池 {len(pool)} 篇**做 Cross-Encoder 重排后，"
-                 f"每节分数 ≥{RERANK_MIN_SCORE} 的论文数）："]
-        for s, v in report.items():
-            lines.append(f"  {icon.get(v['status'], '•')} {s}：相关 {v['count']} 篇（{v['status']}）"
-                         f"｜候选 {v['candidates']} 篇，最高分 {v['top_score']}")
-        if gaps:
-            lines.append(f"缺口（missing）：{'、'.join(gaps)}")
-        if thin:
-            lines.append(f"偏少（thin）：{'、'.join(thin)}")
-        lines.append(f"\n📊 每节已选 {CARDS_PER_SECTION} 篇"
-                     f"最有代表性且能取到全文的论文作为精读候选（共 {len(sel_out)} 篇）。"
-                     f"调 read_sections 可一次性精读各节候选，生成分节卡片。")
-
-        print(f"--> [Tool:check_coverage] {report} | gaps={gaps}")
-        return Command(update={
-            "coverage_report": report, "gaps": gaps, "selected_papers": sel_out,
-            "section_candidates": cands,
-            "paper_pool": pool_updates,
-            "messages": [ToolMessage(content="\n".join(lines), tool_call_id=tool_call_id)],
-        })
-
-    return check_coverage
-
-
-def _check_coverage_llm_fallback(llm, state, tool_call_id, outline, pool, sections):
-    """重排不可用时的降级路径：退回「LLM 看渲染池判相关性」（旧行为）。"""
-    from langchain_core.prompts import ChatPromptTemplate
-    thread_id = state.get("session_id", "")
-    prompt = ChatPromptTemplate.from_messages([
-        ("system",
-         "你是资料覆盖度评审。给定综述大纲的章节列表和论文列表，判断每个章节有多少篇**相关**论文。\n"
-         "输出 JSON（只输出 JSON）：\n"
-         '{{"coverage":[{{"section":"章节名","count":<相关论文数>,'
-         '"status":"covered|thin|missing"}}]}}\n'
-         "status：covered=≥4篇、thin=1-3篇、missing=0篇。"),
-        ("user", "章节列表：{sections}\n\n论文列表：\n{data}"),
-    ])
-    coverage = []
-    with tracing.span("llm", "check_coverage_fallback", thread_id) as sp:
-        try:
-            resp = (prompt | llm).invoke({"sections": "、".join(sections),
-                                          "data": render_pool(pool, max_chars=16000)})
-            um = getattr(resp, "usage_metadata", None) or {}
-            sp["tokens"] = int(um.get("total_tokens", 0) or 0)
-            raw = resp.content if hasattr(resp, "content") else str(resp)
-            s, e = raw.find("{"), raw.rfind("}")
-            coverage = json.loads(raw[s:e + 1]).get("coverage", []) if s != -1 and e != -1 else []
-        except Exception as ex:
-            print(f"--> [Tool:check_coverage] 降级路径解析失败: {ex}")
-
-    report = {}
-    for s in sections:
-        hit = next((c for c in coverage if c.get("section") == s), None)
-        report[s] = {"count": int((hit or {}).get("count") or 0),
-                     "status": (hit or {}).get("status", "missing")}
-    gaps = [s for s, v in report.items() if v["status"] == "missing"]
-    lines = ["覆盖度报告（⚠️ 重排不可用，已降级为 LLM 判断）："]
-    icon = {"covered": "✅", "thin": "⚠️", "missing": "❌"}
-    for s, v in report.items():
-        lines.append(f"  {icon.get(v['status'], '•')} {s}：{v['count']} 篇（{v['status']}）")
-    return Command(update={"coverage_report": report, "gaps": gaps,
-                           "messages": [ToolMessage(content="\n".join(lines),
-                                                    tool_call_id=tool_call_id)]})
-
-def fetch_and_card(items: list, llm, thread_id: str = "") -> tuple[list, list]:
-    """并发取结构化全文 → Map 成卡片。items: [{"id","title","section"}, ...]
+    v1.2.15 MQ1 制卡流水线：on_paper 非空时启用——下载完成**只回调 on_paper(block)**
+    （read_sections 送 MQ1 队列），不再主线程制卡（制卡由 MQ1 消费者并发做，
+    关键词失败转 MQ2 LLM 兜底，制卡成功自动入 MQ3）；返回 (cards=[], failed)。
+    on_paper 为空 → 旧路径（主线程制卡 + on_card 流式送 MQ3）。
 
     抽成独立函数，让 read_papers（模型指定 id）与 read_sections（按节自动选）
     共用同一套「取全文 + 提炼卡片」逻辑，避免两份实现漂移。
@@ -1338,19 +1251,26 @@ def fetch_and_card(items: list, llm, thread_id: str = "") -> tuple[list, list]:
     """
     from ResearcherAgent.core.graph_nodes import _title_relevant, _map_to_cards
     from ResearcherAgent.retrieval.fulltext import (fetch_arxiv_fulltext, fetch_pmc_fulltext,
-                                      fetch_oa_fulltext)
+                                      fetch_oa_fulltext, fetch_core_fulltext)
 
     def _fetch(it: dict) -> dict | None:
         pid, title, section = it.get("id", ""), it.get("title", ""), it.get("section", "")
         with tracing.span("tool", "fulltext", thread_id, id=pid):
             if re.match(r"^PMC\d+", pid, re.I):
-                t = fetch_pmc_fulltext(pid, 30000)
+                t = fetch_pmc_fulltext(pid, None)
             elif pid.lower().startswith("arxiv:"):
-                t = fetch_arxiv_fulltext(pid.split(":", 1)[1], 30000)
+                t = fetch_arxiv_fulltext(pid.split(":", 1)[1], None)
             elif re.match(r"^\d{4}\.\d{4,5}", pid):
-                t = fetch_arxiv_fulltext(pid, 30000)
+                t = fetch_arxiv_fulltext(pid, None)
             elif pid.lower().startswith("oa:"):
-                t = fetch_oa_fulltext(pid[3:], 30000)
+                url = pid[3:]
+                t = fetch_oa_fulltext(url, None)
+                # v1.2.9：core.ac.uk/download/<id> 是**前端 PDF 端点**，Cloudflare 对服务器
+                # 直连/浏览器头/Tavily 全部拦截（403）；且 download 的 id ≠ CORE work id
+                # （works/{id} 实测 404）。真正有效通路是 CORE API 按论文 DOI/标题取全文
+                # （E2E 已证 works/{id} 稳定返回 fullText）——用记录里的 doi/title 补一次。
+                if not t and "core.ac.uk/download" in url:
+                    t = fetch_core_fulltext(doi=(it.get("doi") or ""), title=(it.get("title") or ""))
             else:
                 return None
         if not t or len(t) < 300:
@@ -1359,21 +1279,43 @@ def fetch_and_card(items: list, llm, thread_id: str = "") -> tuple[list, list]:
         if title and not _title_relevant(title, t):
             print(f"    ✗ {title[:40]}：全文与标题不匹配，丢弃")
             return None
-        return {"title": title or pid, "id": pid, "text": t, "section": section}
+        return {"title": title or pid, "id": pid, "text": t, "section": section,
+                **({"num": it.get("num")} if it.get("num") is not None else {})}
 
     items = [it for it in (items or []) if it.get("id")]
     if not items:
         return [], []
-    with ThreadPoolExecutor(max_workers=TOOL_CONCURRENCY) as ex:
-        blocks = [b for b in ex.map(_fetch, items) if b]
-
-    cards = []
-    if blocks:
-        with tracing.span("llm", "map_to_cards", thread_id):
-            cards = _map_to_cards(blocks, llm)
-        sec_by_id = {b["id"]: b.get("section", "") for b in blocks}
-        for c in cards:
-            c["section"] = sec_by_id.get(c.get("id", ""), "")
+    # 下载并发（网络 IO 为主，DOWNLOAD_CONCURRENCY=6，保留退避）+ 流式：
+    # on_paper 模式（v1.2.15 MQ1）——下载完成立即回调（送 MQ1 制卡队列），不制卡；
+    # 旧路径——每篇全文就绪立即制卡（制卡确定性、embedding 快），并触发 on_card（送 MQ3）。
+    cards: list = []
+    blocks: list = []
+    import concurrent.futures as _cf
+    with ThreadPoolExecutor(max_workers=DOWNLOAD_CONCURRENCY) as ex:
+        futs = {ex.submit(_fetch, it): it for it in items}
+        for fut in _cf.as_completed(futs):
+            b = fut.result()
+            if not b:
+                continue
+            blocks.append(b)
+            if on_paper is not None:
+                try:
+                    on_paper(b)
+                except Exception as _e:
+                    print(f"    [fulltext] on_paper 回调失败 {type(_e).__name__}: {str(_e)[:80]}")
+                continue
+            try:
+                cs = _map_to_cards([b], llm)
+            except Exception:
+                cs = []
+            for c in cs:
+                c["section"] = b.get("section", "")
+                cards.append(c)
+                if on_card:
+                    try:
+                        on_card(c)
+                    except Exception as _e:
+                        print(f"    [fulltext] on_card 回调失败 {type(_e).__name__}: {str(_e)[:80]}")
     failed = [it["id"] for it in items if it["id"] not in {b["id"] for b in blocks}]
     return cards, failed
 
@@ -1392,61 +1334,314 @@ def make_read_sections(llm):
         sections: list[str] | None = None,
         per_section: int = CARDS_PER_SECTION,
     ) -> Command:
-        """按**章节**精读：每节从 check_coverage 产出的重排候选中取前 N 篇，
-        取结构化全文并提炼成卡片（问题/方法/结果/局限），卡片带章节归属。
+        """按**章节**精读：每节对池内论文做 Cross-Encoder 重排（确定性，无需 LLM），
+        取前 N 篇取结构化全文并提炼成卡片（问题/方法/结果/局限），卡片带章节归属。
 
         sections：要精读的章节名列表；留空则读全部章节。
-        per_section：每节读几篇（默认 2）。
-        建议在 check_coverage 之后调用，这样每节都有专属素材，避免某些节一张卡片都没有。
-        取不到全文的会跳过（不编造）。
+        per_section：每节读几篇（默认 2）。**方法节请传 10**（方案 v1.2：方法节 top-10，
+        共 30-40 篇，引言/展望不单独选文）；全文通路不足的会自动跳过，不编造。
         """
-        cands = (state.get("section_candidates") or {}).get("sections") or {}
-        if not cands:
+        outline = state.get("review_outline", []) or []
+        pool = state.get("paper_pool", []) or []
+        if not outline:
             return Command(update={"messages": [ToolMessage(
-                content="尚无分节候选，请先调用 check_coverage（它会做全池重排）。",
+                content="尚无大纲，请先调用 make_outline。",
                 tool_call_id=tool_call_id, status="error")]})
+        # v1.2.7：不再依赖 check_coverage（该步已从链路删除）——这里直接对池内论文
+        # 做确定性重排选候选（select_section_candidates 为 Cross-Encoder 全池重排，无 LLM）。
+        cands_map = select_section_candidates(pool, outline, thread_id=state.get("session_id", ""))
+        cands = cands_map or {}
+        # v1.2.11 节级护栏①（候选不足 → 删节或并入相邻节，禁止补检）：
+        # 可精读候选 < MIN_PAPERS_PER_SECTION → 优先**并入大纲中它前面最近的方法节**
+        # （候选合并到该节列表，制卡时卡片 section 直接用合并后节名 → write 归节自然映射
+        # 到新大纲节，即"合并=json 大纲对应到新大纲章节"）；前面没有可并的方法节才删除。
+        # **不再做第二轮补检**——补检浪费时间、返回的又多是只有摘要的题录。
+        def _is_method_sec(name: str) -> bool:
+            return not any(k in name for k in (
+                "引言", "展望", "结论", "总结", "未来", "背景",
+                "Introduction", "Conclusion", "Outlook", "Future", "Background",
+                "introduction", "conclusion", "outlook", "future", "background"))
 
-        want = [s for s in (sections or []) if s in cands] or list(cands.keys())
-        picks = per_section_top_cards({s: cands[s] for s in want}, per_section=per_section)
-        if not picks:
+        # v1.2.18：精读节**强制以 state.review_outline 节名为准**（防节名漂移）。
+        # 长 agent 循环中模型传参可能复用旧大纲节名 → 护栏①③删不到新大纲节、
+        # write 归节失败、补写无素材节（忠实度受损）。只精读大纲中现存的方法节；
+        # 模型传入的旧节名丢弃（打印提示），未传节名则全部方法节。
+        outline_names = [o.get("section", "") for o in outline]
+        _valid_method = [s for s in outline_names
+                         if s in cands and _is_method_sec(s)]
+        if sections:
+            want = [s for s in (sections or []) if s in _valid_method]
+            if want:
+                print(f"--> [Tool:read_sections] ℹ️ 精读节以大纲为准"
+                      f"（忽略传入的旧节名: "
+                      f"{[s for s in (sections or []) if s not in want] or '∅'}）")
+            else:
+                want = list(_valid_method)   # 传入全为旧名 → 回退全部方法节
+        else:
+            want = list(_valid_method)
+        # 每节候选（有全文 id 的，已按 RERANK_MIN_CAND_SCORE 过滤）拉全列表，
+        # 前 per_section 篇下载失败 → 自动从该节剩余候选中补位，直到凑满名额或候选耗尽。
+        sec_lists = {}
+        for s in want:
+            cs = [c for c in (cands.get(s) or {}).get("candidates") or []
+                  if c.get("readable_id")]
+            sec_lists[s] = cs
+
+        dropped: list = []
+        merged_map: dict[str, str] = {}   # 被并节 → 并入的目标方法节
+        for s in list(sec_lists.keys()):
+            if len(sec_lists[s]) >= MIN_PAPERS_PER_SECTION:
+                continue
+            prev = None
+            for m in outline_names:        # 大纲顺序中 s 之前最近的、仍保留的方法节
+                if m == s:
+                    break
+                if m in sec_lists and _is_method_sec(m):
+                    prev = m
+            if prev is not None:
+                sec_lists[prev] = sec_lists[prev] + sec_lists[s]   # 候选合并到前一方法节
+                merged_map[s] = prev
+            else:
+                dropped.append(s)
+            del sec_lists[s]
+        outline_kept = [o for o in outline
+                        if o.get("section", "") not in dropped
+                        and o.get("section", "") not in merged_map]
+        if dropped or merged_map:
+            print(f"--> [Tool:read_sections] ⚠️ 候选 < {MIN_PAPERS_PER_SECTION} 篇（不再补检）："
+                  f"并入相邻方法节 {merged_map or '∅'}，删除 {dropped or '∅'}")
+
+        # v1.2.11 节级护栏②（已精读节跳过，幂等）：
+        # 模型重复调用 read_sections 时，该节已有足量卡片 → 直接复用，不再重新下载精读。
+        existing_by_sec: dict = {}
+        for _c in state.get("paper_cards", []) or []:
+            existing_by_sec.setdefault(_c.get("section", ""), []).append(_c)
+        skip_existing = [s for s in sec_lists
+                         if len(existing_by_sec.get(s, [])) >= min(per_section, MIN_PAPERS_PER_SECTION)]
+        for s in skip_existing:
+            del sec_lists[s]
+        if skip_existing:
+            print(f"--> [Tool:read_sections] ℹ️ 以下节已精读足量卡片，跳过不重读："
+                  f"{[s[:24] for s in skip_existing]}")
+
+        if not any(sec_lists.values()):
             return Command(update={"messages": [ToolMessage(
-                content="候选为空，无可精读论文。", tool_call_id=tool_call_id, status="error")]})
+                content="各节候选里都没有可获取全文的 id（arXiv/PMC/OA）。"
+                        "按规则**不再补检**：候选不足的节已删除/合并，若所有方法节都被删除，"
+                        "请直接结束研究进入 write（由引言/展望素材概括成稿），不要再次调用 search_*。",
+                tool_call_id=tool_call_id)]})
 
         thread_id = state.get("session_id", "")
         pool = state.get("paper_pool", []) or []
         by_key = {paper_key(p): p for p in pool}
-        items = []
-        for c in picks:
-            p = by_key.get(c.get("key") or "")
-            pid = c.get("readable_id") or (p and _paper_id_for_fulltext(p)) or ""
-            if pid:
-                items.append({"id": pid, "title": c.get("title", ""),
-                              "section": c.get("section", "")})
-        if not items:
-            return Command(update={"messages": [ToolMessage(
-                content="各节候选里都没有可获取全文的 id（arXiv/PMC）。"
-                        f"可改用有全文通路的源补检索（如 {_healthy_sources(thread_id)}），"
-                        "或直接 ask_user。",
-                tool_call_id=tool_call_id)]})
 
-        print(f"--> [Tool:read_sections] {len(want)} 节 × 每节 {per_section} 篇 → 待读 {len(items)} 篇")
-        cards, failed = fetch_and_card(items, llm, thread_id)
+        # v1.2.10 流式 MQ：卡片边制边送（每出一张卡立即入队，JSON 块提取与后续
+        # 下载/补位并行，不等全部制完；write 节点用 json_build_session_id 收集）。
+        session_id = state.get("json_build_session_id") or ""
 
-        lines = [f"分节精读完成：{len(cards)} 张卡片（每节最多 {per_section} 篇，已带章节归属）。"]
+        def _on_card(c):
+            nonlocal session_id
+            try:
+                if not session_id:
+                    from ResearcherAgent.async_pipeline import start_json_session
+                    session_id = start_json_session([c], llm)
+                else:
+                    from ResearcherAgent.async_pipeline import extend_json_session
+                    extend_json_session(session_id, [c])
+            except Exception as _e:
+                print(f"    [card_to_json] 流式送 MQ3 失败 {type(_e).__name__}: {str(_e)[:80]}"
+                      f" → session_id 保持 {'空' if not session_id else session_id}，"
+                      f"write 节点 submit_cards_for_json 降级")
+
+        # v1.2.15 MQ1 制卡流水线：先启动制卡会话（MQ1）+ JSON 会话（MQ3 空启动，
+        # 让制卡消费者边制卡边送 MQ3）；下载完成即送 MQ1（并发制卡，关键词失败
+        # 转 MQ2 LLM 兜底），collect 等全部制卡完成后做护栏③。MQ 不可用 →
+        # 降级同步制卡（旧路径：主线程 _map_to_cards + _on_card 流式送 MQ3）。
+        cb_sid = ""
+        try:
+            from ResearcherAgent.async_pipeline import start_card_build_session
+            cb_sid = start_card_build_session([], llm)
+        except Exception as _e:
+            print(f"    [card_build] MQ1 会话启动失败 {type(_e).__name__}: {str(_e)[:80]}"
+                  f" → 降级同步制卡")
+            cb_sid = ""
+
+        cards: list = []
+        failed_global: list = []
+        got_by_sec: dict = {}
+        tried_keys: set = set()
+        print(f"--> [Tool:read_sections] {len(want)} 节 × 每节 {per_section} 篇"
+              f"（下载失败自动补位 1 轮，候选池 {sum(len(v) for v in sec_lists.values())} 篇）"
+              + (f" | MQ1 制卡流水线开启" if cb_sid else " | MQ 不可用 → 同步制卡降级"))
+        # v1.2.11 补位轮数 3 → 1：一轮下载失败即止，不足 MIN_PAPERS_PER_SECTION 的节
+        # 由护栏③在下载后复核删除——不反复重试下载浪费时间（用户决策：不再第二轮补检）。
+        for _round in range(1):  # 仅 1 轮补位（候选耗尽即止）
+            items = []
+            for s in want:
+                if s not in sec_lists:
+                    continue  # 该节已被护栏①删除
+                need = per_section - len(got_by_sec.get(s, []))
+                if need <= 0:
+                    continue
+                picked = [c for c in sec_lists[s] if c.get("key") not in tried_keys][:need]
+                for c in picked:
+                    tried_keys.add(c.get("key"))
+                    p = by_key.get(c.get("key") or "")
+                    pid = c.get("readable_id") or (p and _paper_id_for_fulltext(p)) or ""
+                    if pid:
+                        items.append({"id": pid, "title": c.get("title", ""),
+                                      "section": s})
+            if not items:
+                break
+            if cb_sid:
+                jsid = session_id or ""
+                if not jsid:
+                    try:
+                        from ResearcherAgent.async_pipeline import start_json_session
+                        jsid = start_json_session([], llm)   # MQ3 空启动，消费者边制卡边送
+                        session_id = jsid                    # 写回外层，尾部 update state
+                    except Exception:
+                        jsid = ""
+
+                def _on_paper(b, _jsid=jsid):
+                    try:
+                        from ResearcherAgent.async_pipeline import extend_card_build_session
+                        extend_card_build_session(cb_sid,
+                                                  [{**b, "json_session_id": _jsid}])
+                    except Exception as _e:
+                        print(f"    [card_build] 流式送 MQ1 失败 {type(_e).__name__}: "
+                              f"{str(_e)[:80]}（该篇走同步制卡兜底）")
+
+                _, failed_r = fetch_and_card(items, llm, thread_id, on_paper=_on_paper)
+                try:
+                    from ResearcherAgent.async_pipeline import collect_card_build_session
+                    replies = collect_card_build_session(cb_sid)
+                    cards_r = [r["data"]["card"] for r in replies.values()
+                               if r and r.get("ok") and (r.get("data") or {}).get("card")]
+                except Exception as e:
+                    print(f"    [card_build] MQ1 collect 失败 {str(e)[:80]} → 本节卡片为空"
+                          f"（护栏③将删节/合并）")
+                    cards_r = []
+            else:
+                cards_r, failed_r = fetch_and_card(items, llm, thread_id, on_card=_on_card)
+            failed_global += failed_r
+            for c in cards_r:
+                got_by_sec.setdefault(c.get("section", ""), []).append(c.get("title", ""))
+            cards += cards_r
+
+        # v1.2.11 句级引用锚点：制卡阶段分配池内全局编号 [N]（写入卡片 num 字段），
+        # LLM 提取块时直接在论断句后标注 [N]；组装期只校验纠正，不再重映射。
+        # v1.2.17：gidx 提前算——MQ1 消息带 num（关键词制卡/MQ2 直接提取共用同一编号）。
+        try:
+            gidx = global_index(pool)
+        except Exception:
+            gidx = {}
+        for it in items:
+            n = None
+            pid = it.get("id", "")
+            for p in pool:
+                if pid and pid in {str(p.get("id", "")), str(p.get("paper_id", "")),
+                                   str(p.get("arxiv_id", "")), str(p.get("pmcid", "") or "")}:
+                    n = gidx.get(paper_key(p))
+                    break
+            if n is None:
+                tn = _norm_card_title(it.get("title", ""))
+                if tn:
+                    for p in pool:
+                        if _norm_card_title(p.get("title", "")) == tn:
+                            n = gidx.get(paper_key(p))
+                            break
+            it["num"] = n  # None → 组装期兜底补编号
+
+        for c in cards:
+            n = None
+            pid = c.get("id", "")
+            for p in pool:
+                if pid and pid in {str(p.get("id", "")), str(p.get("paper_id", "")),
+                                   str(p.get("arxiv_id", "")), str(p.get("pmcid", "") or "")}:
+                    n = gidx.get(paper_key(p))
+                    break
+            if n is None:
+                tn = _norm_card_title(c.get("title", ""))
+                if tn:
+                    for p in pool:
+                        if _norm_card_title(p.get("title", "")) == tn:
+                            n = gidx.get(paper_key(p))
+                            break
+            c["num"] = n  # None → 组装期兜底补编号
+
+        # v1.2.11 节级护栏③（下载后复核）：实际精读卡片 < MIN_PAPERS_PER_SECTION 的节，
+        # 优先**并入大纲中它前面最近的方法节**（该节已制卡片的 section 改写为合并后节名 →
+        # write 归节与 MQ 块自然映射到新大纲节）；前面没有可并的方法节才删除。
+        # 全程不再补检——下载失败不反复重试（用户决策：不再第二轮补检）。
+        by_sec_real: dict = {}
+        for c in cards:
+            by_sec_real.setdefault(c.get("section", ""), []).append(c)
+        kept_names = [o.get("section", "") for o in outline_kept]
+        dropped2: list = []
+        rename2: dict[str, str] = {}
+        for s in sec_lists:
+            if len(by_sec_real.get(s, [])) >= MIN_PAPERS_PER_SECTION:
+                continue
+            prev = None
+            for m in kept_names:             # 大纲（护栏①后）中 s 之前最近的方法节
+                if m == s:
+                    break
+                if _is_method_sec(m):
+                    prev = m
+            if prev is not None:
+                rename2[s] = prev
+            else:
+                dropped2.append(s)
+        for c in cards:
+            if c.get("section", "") in rename2:
+                c["section"] = rename2[c["section"]]
+        outline_final = [o for o in outline_kept
+                         if o.get("section", "") not in dropped2
+                         and o.get("section", "") not in rename2]
+        if dropped2 or rename2:
+            print(f"--> [Tool:read_sections] ⚠️ 实际精读 < {MIN_PAPERS_PER_SECTION} 篇（不再补检）："
+                  f"并入相邻方法节 {rename2 or '∅'}，删除 {dropped2 or '∅'}")
+
+        lines = [f"分节精读完成：{len(cards)} 张卡片（每节最多 {per_section} 篇，已带章节归属；"
+                 f"下载失败已从同节候选自动补位）。"]
         by_sec = {}
         for c in cards:
             by_sec.setdefault(c.get("section", ""), []).append(c.get("title", ""))
         for s in want:
+            if s in merged_map or s in rename2:
+                lines.append(f"  ➤ {s[:34]}：已并入相邻方法节（不再补检）")
+                continue
             got = by_sec.get(s, [])
             lines.append(f"  {'✓' if got else '✗'} {s[:34]}：{len(got)} 张")
             for t in got:
                 lines.append(f"      · {t[:60]}")
-        if failed:
-            lines.append(f"  ✗ 取不到全文：{', '.join(failed[:6])}")
-        return Command(update={
+        if failed_global:
+            lines.append(f"  ✗ 取不到全文（已补位仍失败）：{', '.join(failed_global[:6])}")
+        if dropped:
+            lines.append(f"  ✗ 候选不足 {MIN_PAPERS_PER_SECTION} 篇已删除大纲节（不再补检）：{dropped}")
+        if merged_map:
+            lines.append(f"  ➤ 候选不足 {MIN_PAPERS_PER_SECTION} 篇已并入相邻方法节（不再补检）："
+                         f"{merged_map}")
+        if dropped2:
+            lines.append(f"  ✗ 实际精读不足 {MIN_PAPERS_PER_SECTION} 篇已删除大纲节：{dropped2}")
+        if rename2:
+            lines.append(f"  ➤ 实际精读不足 {MIN_PAPERS_PER_SECTION} 篇已并入相邻方法节"
+                         f"（卡片归属已改写）：{rename2}")
+        # 写回重排结果供「一轮检索后证据不足拒答门」（_pool_relevant_ratio_mean）使用：
+        # 该门读 state.section_candidates.sections[*].n_relevant/scored_total。
+        update = {
             "paper_cards": cards,
+            "section_candidates": {"_pool_n": len(pool), "sections": cands_map},
             "messages": [ToolMessage(content="\n".join(lines), tool_call_id=tool_call_id)],
-        })
+        }
+        if outline_final != outline:
+            update["review_outline"] = outline_final
+        if session_id:
+            update["json_build_session_id"] = session_id
+            print(f"--> [Tool:read_sections] 流式 MQ 会话 {session_id}"
+                  f"（累计 {len(cards)} 张卡片本次增量入队）")
+        return Command(update=update)
 
     return read_sections
 
@@ -1469,16 +1664,11 @@ def make_read_papers(llm):
 
         thread_id = state.get("session_id", "")
         pool = state.get("paper_pool", []) or []
-        selected = state.get("selected_papers", []) or []
         title_by_id = {}
         section_by_id = {}
-        for s in selected:
-            if s.get("id"):
-                title_by_id[s["id"]] = s.get("title", "")
-                section_by_id[s["id"]] = s.get("section", "")
         for p in pool:
             pid = _paper_id_for_fulltext(p)
-            if pid and pid not in title_by_id:
+            if pid:
                 title_by_id[pid] = p.get("title", "")
                 section_by_id[pid] = (p.get("sections") or [""])[0]
 
@@ -1490,12 +1680,12 @@ def make_read_papers(llm):
         def _fetch(pid: str) -> dict | None:
             with tracing.span("tool", "fulltext", thread_id, id=pid):
                 if re.match(r"^PMC\d+", pid, re.I):
-                    t = fetch_pmc_fulltext(pid, 30000)
+                    t = fetch_pmc_fulltext(pid, None)
                 elif pid.lower().startswith("arxiv:"):
                     pid = pid.split(":", 1)[1]
-                    t = fetch_arxiv_fulltext(pid, 30000)
+                    t = fetch_arxiv_fulltext(pid, None)
                 elif re.match(r"^\d{4}\.\d{4,5}", pid):
-                    t = fetch_arxiv_fulltext(pid, 30000)
+                    t = fetch_arxiv_fulltext(pid, None)
                 else:
                     return None
             title = title_by_id.get(pid, "")
@@ -1507,13 +1697,17 @@ def make_read_papers(llm):
                 return None
             return {"title": title or pid, "id": pid, "text": t, "section": section_by_id.get(pid, "")}
 
-        with ThreadPoolExecutor(max_workers=TOOL_CONCURRENCY) as ex:
+        with ThreadPoolExecutor(max_workers=DOWNLOAD_CONCURRENCY) as ex:
             blocks = [b for b in ex.map(_fetch, ids) if b]
 
         cards = []
         if blocks:
             with tracing.span("llm", "map_to_cards", thread_id):
-                cards = _map_to_cards(blocks, llm)
+                n = max(1, min(EXTRACT_CONCURRENCY, len(blocks)))
+                chunks = [blocks[i::n] for i in range(n)]
+                with ThreadPoolExecutor(max_workers=n) as ex2:
+                    card_lists = list(ex2.map(lambda ch: _map_to_cards(ch, llm), chunks))
+                cards = [c for cl in card_lists for c in cl]
             sec_by_id = {b["id"]: b.get("section", "") for b in blocks}
             for c in cards:
                 c["section"] = sec_by_id.get(c.get("id", ""), "")
@@ -1529,7 +1723,7 @@ def make_read_papers(llm):
             lines.append("  ⚠️ 全文已取到但卡片提炼为空。")
         if not blocks and ids:
             lines.append("  💡 全文通道可能不可达：可改用 search_europepmc 找有 PMC 全文的论文，"
-                         "或直接用检索到的标题+摘要写作（ask_user 后进入写作），不必反复重试。")
+                         "或直接用检索到的标题+摘要写作，不必反复重试。")
         return Command(update={
             "paper_cards": cards,   # 只回新增卡片，AgentState 用 merge_paper_cards 追加去重
             "messages": [ToolMessage(content="\n".join(lines), tool_call_id=tool_call_id)],
@@ -1538,161 +1732,7 @@ def make_read_papers(llm):
     return read_papers
 
 
-def render_review_view(state: dict) -> str:
-    """确定性渲染人机审核视图：大纲 + 每节覆盖度 + 按节列出的论文（不再用 LLM 重排版）。"""
-    outline = state.get("review_outline", []) or []
-    coverage = state.get("coverage_report", {}) or {}
-    gaps = state.get("gaps", []) or []
-    pool = state.get("paper_pool", []) or []
-    cards = state.get("paper_cards", []) or []
-    todos = state.get("todos", []) or []
-
-    lines = ["## 📋 综述大纲与资料覆盖情况", ""]
-    icon = {"covered": "✅", "thin": "⚠️", "missing": "❌"}
-    if outline:
-        for o in outline:
-            sec = o.get("section", "")
-            c = coverage.get(sec, {})
-            status = c.get("status", "?")
-            budget = ""
-            if c.get("section_with_abstract") is not None:
-                budget = (f"｜带摘要 {c['section_with_abstract']}/{c.get('section_total', '?')} 篇"
-                          f"｜写作可注入 {c.get('injectable', '?')} 篇")
-            lines.append(f"- {icon.get(status, '•')} **{sec}**：{c.get('count', '?')} 篇"
-                         + budget
-                         + (f" — {o.get('focus')}" if o.get("focus") else "")
-                         + ("（建议补充）" if status == "thin" else "")
-                         + ("（未找到，建议补充或删除此节）" if status == "missing" else ""))
-        if gaps:
-            lines.append("\n> ⚠️ 缺口方向：" + "、".join(gaps))
-    else:
-        lines.append("（尚未规划大纲）")
-    lines.append(f"\n> 共检索到 {len(pool)} 篇去重论文，已精读 {len(cards)} 篇。")
-    lines.append("> 请审核**范围**（分类是否合理、要不要增删方向），再决定是否继续。\n")
-    if todos:
-        ti = {"done": "✅", "in_progress": "🔄", "pending": "⬜"}
-        lines.append("**Agent 任务清单：**")
-        lines += [f"- {ti.get(t.get('status'), '⬜')} {t.get('task', '')}" for t in todos]
-        lines.append("")
-    lines.append("---\n")
-
-    # 按节列论文
-    listed = set()
-    for o in outline:
-        sec = o.get("section", "")
-        sec_papers = [p for p in pool if sec in (p.get("sections") or [])]
-        if not sec_papers:
-            continue
-        lines.append(f"### {sec}")
-        for p in sec_papers[:15]:
-            listed.add(paper_key(p))
-            lines.append("- " + render_paper(p, with_abstract=False))
-            ab = (p.get("abstract") or "").strip().replace("\n", " ")
-            if ab:
-                lines.append(f"  摘要：{ab[:120]}")
-        if len(sec_papers) > 15:
-            lines.append(f"  …另 {len(sec_papers) - 15} 篇")
-        lines.append("")
-    others = [p for p in pool if paper_key(p) not in listed]
-    if others:
-        lines.append("### 其它检索结果（未归属章节）")
-        for p in others[:20]:
-            lines.append("- " + render_paper(p, with_abstract=False))
-        if len(others) > 20:
-            lines.append(f"  …另 {len(others) - 20} 篇")
-    return "\n".join(lines)
-
-
-@tool
-def ask_user(
-    tool_call_id: Annotated[str, InjectedToolCallId],
-    state: Annotated[dict, InjectedState],
-    note: str = "",
-) -> Command:
-    """暂停并把当前大纲 + 覆盖度 + 资料清单交给用户审核（人机检查点）。
-
-    用户会回复 accept（继续写作）/ skip（跳过审核直接写）/ re_search（附修改要求：增删方向、换关键词等）。
-    ⚠️ 必须**单独调用**（不要与其它工具并列）；写综述前必须至少调用一次。
-    note：可选，你想对用户补充说明的一句话（如哪些方向检索困难）。
-    """
-    search_round = int(state.get("search_round", 0) or 0)
-    if search_round >= MAX_SEARCH_ROUNDS:
-        return Command(update={"messages": [ToolMessage(
-            content=f"已达最大审核/检索轮次（{MAX_SEARCH_ROUNDS}），不再询问用户，请直接收尾进入写作。",
-            tool_call_id=tool_call_id)]})
-
-    view = render_review_view(state)
-    if note:
-        view = f"> 💬 Agent 说明：{note}\n\n" + view
-    print(f"--> [Tool:ask_user] 第 {search_round + 1} 轮，等待用户审核...")
-    decision = interrupt({"type": "review_materials", "materials": view, "search_round": search_round + 1})
-
-    fb = decision if isinstance(decision, dict) else {"action": str(decision), "feedback": ""}
-    action = fb.get("action", "accept")
-    feedback = (fb.get("feedback") or "").strip()
-    print(f"--> [Tool:ask_user] 用户决策: {action} {feedback[:80]!r}")
-    if action == "re_search":
-        msg = (f"用户要求重新检索/调整范围：「{feedback or '（未说明）'}」。\n"
-               "请据此用 make_outline 增量修改大纲（保留未提及章节），针对新增/薄弱方向再检索，"
-               "check_coverage 后再次 ask_user。")
-    elif action == "skip":
-        msg = "用户选择跳过审核，请立即停止调用工具，进入写作。"
-    else:
-        msg = "用户已接受当前范围与资料，请立即停止调用工具，进入写作。"
-    return Command(update={
-        "human_feedback": json.dumps({"action": action, "feedback": feedback}, ensure_ascii=False),
-        "search_round": search_round + 1,
-        "messages": [ToolMessage(content=msg, tool_call_id=tool_call_id)],
-    })
-
-
-# ==========================================
-
-
-@tool
-def discover_directions(
-    min_year: int = 2024,
-    tool_call_id: Annotated[str, InjectedToolCallId] = "",
-    state: Annotated[dict, InjectedState] = None,
-) -> Command:
-    """从论文池中**发现新兴研究方向**：LLM 从近两年文献提取候选方向 → 代码统计验证高频/增长
-    → LLM 对照大纲决策（必须引用具体论文）→ 新方向并入子主题。
-
-    用法：在 expand_seeds 扩展出论文池之后调用（池需 ≥20 篇且含近两年文献）。
-    若新方向需要补充文献，可再用 expand_seeds(seed_titles=新方向的代表性论文标题) 扩展，
-    然后重新 check_coverage。
-    """
-    pool = state.get("paper_pool") or []
-    if len(pool) < 20:
-        return Command(update={"messages": [ToolMessage(
-            content=f"论文池仅 {len(pool)} 篇（需 ≥20 且含近两年文献），"
-                    "先 expand_seeds 扩展后再发现新方向。",
-            tool_call_id=tool_call_id, status="error")]})
-    topic = state.get("topic") or state.get("user_request") or ""
-    subs = state.get("subtopics") or []
-    try:
-        res = dd.run_discovery(pool, topic, subs, min_year=min_year)
-    except Exception as e:
-        return Command(update={"messages": [ToolMessage(
-            content=f"新方向发现失败：{str(e)[:120]}。可稍后重试或继续现有流程。",
-            tool_call_id=tool_call_id, status="error")]})
-    accepted = [d for d in res.get("decisions", []) if d.get("verdict") == "accept"]
-    if not accepted:
-        msg = ("已核对候选方向与统计证据：未发现值得新增的研究方向。"
-               "可继续 check_coverage 或直接进入写作。")
-        return Command(update={"messages": [ToolMessage(
-            content=msg, tool_call_id=tool_call_id)]})
-    lines = [f"+ {d['concept']}（{d['reason'][:60]}）" for d in accepted]
-    msg = ("发现并新增以下研究方向：\n" + "\n".join(lines) +
-           f"\n\n新方向已并入子主题（{len(res.get('new_subtopics', []))} 个）。"
-           "建议：对新方向再调用 expand_seeds 补一轮引文扩展，然后重新 check_coverage。")
-    return Command(update={
-        "subtopics": res.get("updated_subtopics", subs),
-        "coverage_report": {}, "gaps": [], "selected_papers": [],
-        "discovery_report": res.get("decisions", []),
-        "messages": [ToolMessage(content=msg, tool_call_id=tool_call_id)],
-    })
-
+_CARD_FIELD_ORDER = ("background", "method", "experiment", "conclusion")
 
 
 # 3. 渐进式工具加载：按 skills 选工具子集
@@ -1700,15 +1740,11 @@ def discover_directions(
 
 def build_local_tools(llm) -> dict[str, BaseTool]:
     out = {
-        "make_subtopics": make_subtopics,
-        "expand_seeds": expand_seeds,
+        "survey_evolution": make_survey_evolution(llm),
         "make_outline": make_outline,
         "write_todos": write_todos,
-        "check_coverage": make_check_coverage(llm),
-        "discover_directions": discover_directions,
         "read_papers": make_read_papers(llm),
         "read_sections": make_read_sections(llm),
-        "ask_user": ask_user,
     }
     # —— 代码执行工具组（skill "code_exec" 启用；照搬 HKUDS/AI-Researcher terminal_tools）——
     from ResearcherAgent.sandbox.code_executor import (
@@ -1742,11 +1778,16 @@ def build_local_tools(llm) -> dict[str, BaseTool]:
         "novelty_check": make_novelty_check(llm),
         "code_survey": make_code_survey(llm),
     })
-    # —— CC 风格项目记忆（Claude Code Auto Memory 模式）：remember 记录 / consolidate 整理 ——
-    from ResearcherAgent.memory.cc_memory import remember_memory, make_consolidate_memory
+    # —— CC 风格项目记忆（Claude Code Auto Memory 模式 v2）——
+    # remember：写前过滤+查重（LLM 三分类 ADD/UPDATE/NOOP）；consolidate：Dreams 式整理；
+    # recall_memory：按索引定位 topic 文件读具体说明（索引全量注入 + 细节按需读）。
+    from ResearcherAgent.memory.cc_memory import (make_remember_memory,
+                                                  make_consolidate_memory,
+                                                  recall_memory)
     out.update({
-        "remember_memory": remember_memory,
+        "remember_memory": make_remember_memory(llm),
         "consolidate_memory": make_consolidate_memory(llm),
+        "recall_memory": recall_memory,
     })
     return out
 
@@ -1757,21 +1798,17 @@ def select_tools(skills: list[str], mcp_tools: dict[str, BaseTool],
     out: list[BaseTool] = []
     if "search_papers" in skills:
         out += [t for n, t in mcp_tools.items() if is_paper_search_tool(n)]
-    if "search_web" in skills:
-        out += [t for n, t in mcp_tools.items() if is_web_search_tool(n)]
     if "write_review" in skills:
-        out += [local_tools[k] for k in ("write_todos", "make_subtopics", "expand_seeds",
-                                         "make_outline", "check_coverage",
-                                         "read_papers", "read_sections",
-                                         "discover_directions")]
-    if "human_review" in skills:
-        out.append(local_tools["ask_user"])
+        out += [local_tools[k] for k in ("write_todos", "survey_evolution",
+                                         "make_outline", "read_papers", "read_sections")]
+        # L3 按需加载：SKILL.md 正文指向 skills/<name>/references/，模型需要细节时用 read_file 读取
+        out += [local_tools[k] for k in ("read_file",) if k in local_tools]
     if "code_exec" in skills:
         # 代码执行工具组：模型可写文件、跑命令、跑训练脚本（后端由 LANGGRAPH_EXEC_BACKEND 控制）
         from ResearcherAgent.sandbox.code_executor import CODE_EXEC_TOOLS
         out += [local_tools[k] for k in CODE_EXEC_TOOLS if k in local_tools]
-        # CC 风格项目记忆（跨会话沉淀，与代码执行配套）
-        out += [local_tools[k] for k in ("remember_memory", "consolidate_memory")
+        # CC 风格项目记忆（跨会话沉淀，与代码执行配套）：remember/consolidate/recall
+        out += [local_tools[k] for k in ("remember_memory", "consolidate_memory", "recall_memory")
                 if k in local_tools]
     if "innovate" in skills:
         # 创新点验证流水线：检索 + 精读制卡（复用）+ 创新工具 + 代码执行
@@ -1782,7 +1819,7 @@ def select_tools(skills: list[str], mcp_tools: dict[str, BaseTool],
                 if k in local_tools]
         out += [local_tools[k] for k in INNOVATE_TOOLS if k in local_tools]
         out += [local_tools[k] for k in CODE_EXEC_TOOLS if k in local_tools]
-        out += [local_tools[k] for k in ("remember_memory", "consolidate_memory")
+        out += [local_tools[k] for k in ("remember_memory", "consolidate_memory", "recall_memory")
                 if k in local_tools]
     # 去重保序
     seen, uniq = set(), []

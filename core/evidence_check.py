@@ -61,8 +61,15 @@ def _looks_like_claim(sent: str) -> bool:
 
 
 def _split_sentences(text: str):
+    """按**句号级**切句（v1.2.13：去掉分号切分点）。
+
+    锚点口径 = 一句号一句 = 对一篇论文的引用：一个以句号结尾的完整论断句
+    （内部可用逗号/分号连接多个小句），句尾有 [N] 即为有效锚定。
+    分号（；）不再是句子边界——"XX提出了XX；解决了XX；指标XX[12]。"是同一句，
+    中间小句不要求各自标注，避免把完整论断误切碎报 no_citation。
+    """
     out = []
-    for chunk in re.split(r"(?<=[。！？；.!?])\s*|\n+", text or ""):
+    for chunk in re.split(r"(?<=[。！？.!?])\s*|\n+", text or ""):
         c = chunk.strip()
         if c:
             out.append(c)
@@ -162,11 +169,17 @@ def _embed_cached(text: str, embed_fn, cos_cache):
 
 
 def check_section_deterministic(section_text, cite_map, embed_fn, cos_cache,
-                                ref_sample=None, use_nli: bool = True):
+                                ref_sample=None, use_nli: bool = True,
+                                card_nums: set | None = None):
     """一节内的确定性证据检查。返回 [{"sentence","anchors","sim","verdict"}]。
 
-    verdict ∈ no_anchor / no_citation / nli_contradiction / nli_neutral /
-             weak_match / no_evidence_text / ok
+    verdict ∈ no_anchor / no_citation / weak_evidence / nli_contradiction /
+             nli_neutral / weak_match / no_evidence_text / ok
+
+    card_nums（2026-10 新增）：池内有原文证据卡片（精读）的论文编号集合。
+    引用编号全部落在 card_nums 之外 → `weak_evidence`（摘要级弱证据）：
+    综述引用池内未精读论文是正常实践，但论断细节无法被原文核对，标记进低置信
+    清单交用户审核；不再对摘要跑 NLI（摘要太粗、忠实度判不出来），也不再砍编号。
 
     NLI 判定（use_nli=True，默认开）：用多语言蕴含模型（mDeBERTa-XNLI）判断
     「论断句 hypothesis vs 被引论文证据 premise」：
@@ -196,6 +209,12 @@ def check_section_deterministic(section_text, cite_map, embed_fn, cos_cache,
         if not ev:
             findings.append({"sentence": sent[:MAX_SENT_CHARS], "anchors": anchors,
                              "sim": None, "verdict": "no_evidence_text"})
+            continue
+        # ── ②b 全部引用均无精读卡片 → 摘要级弱证据（2026-10）──
+        if card_nums is not None and not any(n in card_nums for n in anchors):
+            findings.append({"sentence": sent[:MAX_SENT_CHARS], "anchors": anchors,
+                             "sim": None, "verdict": "weak_evidence",
+                             "nli_label": None, "nli_score": None})
             continue
         # ── ③ NLI 确定性支持度判定（优先于 embedding；失败才回退边距）──
         nli = None
@@ -291,11 +310,15 @@ def summarize_findings(findings):
                 t = f"NLI 判定论断与引用论文**矛盾**（score={f.get('nli_score')}）"
             lines.append(f"- [{v}] {t}：{f['sentence'][:110]}")
     if soft:
-        lines.append(f"【辅助提示 {len(soft)} 处：**弱信号**——相似度边距偏低，"
-                     f"通用背景句常会误报，需你判断后再决定是否扣分】")
+        lines.append(f"【辅助提示 {len(soft)} 处：**弱信号**——相似度边距偏低或仅摘要级引用，"
+                     f"需你判断后再决定是否扣分】")
         for f in soft[:6]:
-            mg = f.get("margin")
-            lines.append(f"- [weak_match margin={mg}] {f['sentence'][:110]}")
+            v = str(f.get("verdict"))
+            if v == "weak_evidence":
+                lines.append(f"- [weak_evidence] 所引论文仅摘要级（未精读原文）：{f['sentence'][:110]}")
+            else:
+                mg = f.get("margin")
+                lines.append(f"- [weak_match margin={mg}] {f['sentence'][:110]}")
     return "确定性证据检查：\n" + "\n".join(lines)
 
 
@@ -355,6 +378,9 @@ def render_writer_evidence(evidence_report, cite_map, abstract_chars: int = 260,
                     f"——请核对论断是否被引用论文支持")
         elif verdict == "no_evidence_text":
             head = f"### 【{sec}】引用的论文没有可核对的摘要（{verdict}）"
+        elif verdict == "weak_evidence":
+            head = (f"### 【{sec}】所引论文仅摘要级信息（未精读原文）"
+                    f"——论断细节未被原文核对，**请确认未展开实验数据**")
         else:      # weak_match —— 辅助信号，措辞必须留有余地
             head = (f"### 【{sec}】引用的论文未必最贴切"
                     f"（相似度 {sim}，比参照论文高 {margin}）——**请核对后再决定**")

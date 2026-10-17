@@ -120,16 +120,6 @@ async def run_stream(
         t_node = _time.perf_counter()
         async for output in runtime.app.astream(inputs, config=config):
             for node_name, _value in output.items():
-                # ── 检测 LangGraph interrupt（人机审核门，由 ask_user 工具触发） ──
-                if node_name == "__interrupt__":
-                    interrupt_info = _extract_interrupt_value(_value)
-                    yield {
-                        "type": "review_materials",
-                        "materials": interrupt_info.get("materials", ""),
-                        "search_round": interrupt_info.get("search_round", 0),
-                    }
-                    return  # 流结束，等待用户通过 /api/review-action 恢复
-
                 now = _time.perf_counter()
                 tracing.record("node", node_name, thread_id, ms=round((now - t_node) * 1000, 1))
                 t_node = now
@@ -171,9 +161,20 @@ async def run_stream(
             except Exception as e:
                 print(f"--> [MemoryClassify] 提取跳过: {e}")
 
+        # ---- CC 式记忆自动整理（Auto Dream 双门限）：距上次 >24h 且新增 ≥3 条才触发 ----
+        if runtime.llm:
+            try:
+                from ResearcherAgent.memory.cc_memory import maybe_auto_consolidate
+                _cons_res = await asyncio.to_thread(maybe_auto_consolidate, runtime.llm)
+                if _cons_res:
+                    print(f"--> [MemoryAutoConsolidate] {_cons_res}")
+            except Exception as e:
+                print(f"--> [MemoryAutoConsolidate] 跳过: {e}")
+
         if not final_review:
             yield {"type": "error", "message": "未能生成内容，请检查后端日志。"}
         else:
+            review_report = values.get("review_report", {}) or {}
             yield {
                 "type": "result",
                 "content": final_review,
@@ -183,6 +184,18 @@ async def run_stream(
                     "dimensions": {k: v for k, v in review_score.items()
                                    if k not in ("passed", "total_score", "feedback")},
                     "feedback": review_score.get("feedback", ""),
+                },
+                # 评审报告（单次评审不重写）：低置信内容清单 + 原因，交用户审核
+                "review_report": {
+                    "total_score": review_report.get("total_score", "N/A"),
+                    "passed": review_report.get("passed", None),
+                    "threshold": review_report.get("threshold", None),
+                    "dimensions": review_report.get("dimensions", {}),
+                    "citation_rate": review_report.get("citation_rate", None),
+                    "needs_research": review_report.get("needs_research", False),
+                    "issues": review_report.get("issues", []),
+                    "low_confidence": review_report.get("low_confidence", []),
+                    "generated_at": review_report.get("generated_at", ""),
                 },
                 "save_path": save_path,
                 "rewrite_count": values.get("rewrite_count", 0),
@@ -202,19 +215,3 @@ async def run_stream(
         import traceback
         traceback.print_exc()
         yield {"type": "error", "message": f"运行出错: {e}"}
-
-
-def _extract_interrupt_value(interrupt_output) -> dict:
-    """从 astream 的 __interrupt__ 输出中提取 interrupt value 字典。
-
-    LangGraph 1.x 的 __interrupt__ 产出格式为 (Interrupt(value=..., id=...),)
-    Interrupt 是一个 namedtuple/dataclass，value 属性即 interrupt() 调用传入的数据。
-    """
-    if isinstance(interrupt_output, (tuple, list)) and len(interrupt_output) > 0:
-        item = interrupt_output[0]
-        if hasattr(item, "value"):
-            val = item.value
-            return val if isinstance(val, dict) else {}
-    if isinstance(interrupt_output, dict):
-        return interrupt_output
-    return {}

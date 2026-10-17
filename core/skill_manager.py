@@ -10,6 +10,8 @@ skill_manager.py
 3. 按需组合 —— LLM 输出 skills 列表，不是单选标签
 """
 
+import re
+from pathlib import Path
 from typing import Optional
 
 # ==========================================
@@ -21,14 +23,6 @@ SKILL_REGISTRY = {
         "group": "input",
         "description": "调用 arXiv / PubMed 等学术数据库检索论文，返回论文列表和摘要。"
                        "适用：用户需要查找特定主题的最新文献。",
-        "precondition": None,  # 无前提条件
-    },
-    "search_web": {
-        "group": "input",
-        "description": "联网抓取网页内容获取实时/最新信息。"
-                       "适用：需要时效性信息（新闻、最新进展、当前状态）、模型自身知识不确定或可能过时、"
-                       "用户明确要求联网查询、或问题涉及具体网站/链接的内容。"
-                       "注意：这是通用网页信息，不是学术论文检索（那是 search_papers）。",
         "precondition": None,  # 无前提条件
     },
     "index_file": {
@@ -66,18 +60,9 @@ SKILL_REGISTRY = {
     "judge_review": {
         "group": "quality",
         "description": "用独立评委 LLM 对综述从 6 个维度（结构完整性、内容深度、逻辑严谨性、"
-                       "学术规范性、即时约束遵守度、记忆偏好遵守度）打分。低于 7 分触发自动重写（最多 3 轮）。"
+                       "学术规范性、即时约束遵守度、记忆偏好遵守度）打分。低于 8.5 分触发自动重写（最多 3 轮）。"
                        "前提：只有请求里已有 write_review 时才选这个。——问「这篇综述讲了什么」时不要选。",
         "precondition": "paired_with_write_review",
-    },
-    "content_safety": {
-        "group": "quality",
-        "description": "对生成的内容进行安全合规审核（政治合规、用语文明、信息真实性、客观中立）。"
-                       "低于 7 分触发自动重写（最多 3 轮）。"
-                       "适用：用户要求就事件发表评论/观点、生成公开可传播的文本（评论文、分析文、新闻稿等）。"
-                       "纯粹的知识问答、文献综述（已有 judge_review）、文件总结不需要这个。",
-        "precondition": "paired_with_content_generation",
-        # 校验时：必须有 answer_from_context 或 write_review 才生效
     },
 
     # ── 执行类：运行代码（写代码/跑训练/执行命令）──
@@ -92,20 +77,11 @@ SKILL_REGISTRY = {
         "group": "execution",
         "description": "文献→创新点验证流水线：按主题检索论文并精读制卡（复用 search_papers 检索与 "
                        "read_papers 精读卡片机制），LLM 提出 3-5 个潜在创新点，为创新点生成实现代码"
-                       "并在沙箱中运行实验，与基线模型（PatchTST）对比精度，判断创新点是否可行。"
+                       "并在沙箱中运行实验，与基线模型（默认演示：时序领域为 PatchTST，其他领域按主题"
+                       "从精读文献的常用对比模型中选取）对比精度，判断创新点是否可行。"
                        "适用：用户要求「基于这些论文提出创新点并测试」「从文献里找改进方向并跑实验"
                        "验证」「提出 3-5 个创新点看有没有提升」「文献综述→创新点验证」。",
         "precondition": None,
-    },
-
-    # ── 元技能：控制流程（LLM 不选，调度器自动补）──
-    "human_review": {
-        "group": "meta",
-        "description": "在检索完成后暂停，让用户审核找到的资料（标题+摘要），"
-                       "用户可接受、要求重新检索（带补充说明）、或跳过审核直接生成。"
-                       "适用：需要基于检索结果撰写文稿时（write_review + 输入类 skill 同时存在）。"
-                       "调度器自动补充，LLM 无需手动选择。",
-        "precondition": "paired_with_write_review_and_input",
     },
 }
 
@@ -151,25 +127,15 @@ def build_skill_index(has_file: Optional[bool] = None) -> str:
     # ---- 组合示例（教模型如何搭配） ----
     lines.append("## 典型组合示例")
     lines.append("- 简单问答（模型有把握） → `[\"answer_direct\"]`")
-    lines.append("- 联网查实时信息 + 基于结果回答 → `[\"search_web\", \"answer_from_context\"]`")
     lines.append("- 检索论文 + 基于结果回答 → `[\"search_papers\", \"answer_from_context\"]`")
     lines.append("- 检索论文 + 写综述 + 评委 → `[\"search_papers\", \"write_review\", \"judge_review\"]`")
     lines.append("- 上传文件 + 总结/问答 → `[\"index_file\", \"answer_from_context\"]`")
     lines.append("- 上传文件 + 按格式写综述 + 评委 → `[\"index_file\", \"write_review\", \"judge_review\"]`")
-    lines.append("- 联网查事件 + 写评论 + 安全审核 → `[\"search_web\", \"write_review\", \"content_safety\"]`")
     lines.append("- 写代码 / 复刻论文方法 / 跑训练 → `[\"code_exec\"]`（可加 `search_papers` 先查文献）")
     lines.append("- 文献综述→创新点验证：检索精读 + 提出创新点 + 跑实验对比基线 → `[\"innovate\"]`（可加 `search_papers`/`code_exec`）")
-    lines.append("- 联网查信息 + 回答 + 安全审核 → `[\"search_web\", \"answer_from_context\", \"content_safety\"]`")
     lines.append("")
     lines.append("⚠️ 重要：只要用户上传了文件（上下文提示「已上传文件」），任何需要文件内容的请求都必须包含 `index_file`。")
     lines.append("文件刚上传时尚未索引，跳过 `index_file` 会导致系统找不到文件内容。")
-
-    # ---- 何时需要安全审核 ----
-    lines.append("## ⚠️ 何时需要 content_safety（安全审核）")
-    lines.append("- 用户要求**就某个事件/话题发表评论、写评论文章、写观点** → 加 `content_safety`")
-    lines.append("- 用户生成的是**公开可传播的文本**（评论文、分析文、新闻稿、公告）→ 加 `content_safety`")
-    lines.append("- 纯粹的知识问答、文献综述、文件总结 → **不需要** `content_safety`")
-    lines.append("- 注意：`judge_review` 管学术质量，`content_safety` 管内容安全，两者不互斥，可同时使用")
 
     # ---- 关键区分：写综述 vs 问内容 ----
     lines.append("## ⚠️ 最重要的一条区分（写 vs 问）")
@@ -179,14 +145,10 @@ def build_skill_index(has_file: Optional[bool] = None) -> str:
     lines.append("- **不要**给内容询问型请求加 `write_review` 或 `judge_review`——用户不是要写新综述，是在问已有内容。")
     lines.append("")
 
-    # ---- 关键区分：直接回答 vs 联网 ----
-    lines.append("## ⚠️ 何时联网（search_web）")
-    lines.append("- 问题涉及**时效性**（今天/最近/最新/当前价格/近期新闻/版本号）→ 加 `search_web`")
-    lines.append("- 你对答案**不确定**、或信息可能已过时（人物现状、产品动态、事件结果）→ 加 `search_web`")
-    lines.append("- 用户明确要求「联网 / 上网查 / 搜一下 / 查查最新」→ 加 `search_web`")
-    lines.append("- 问题涉及某个具体网址/网站内容 → 加 `search_web`")
-    lines.append("- 纯概念解释、常识、推理、闲聊，且你有把握 → 只用 `answer_direct`，不必联网")
-    lines.append("- 学术论文检索用 `search_papers`，不是 `search_web`；两者可同时选")
+    # ---- 关键区分：直接回答 vs 检索 ----
+    lines.append("## ⚠️ 何时检索（search_papers）")
+    lines.append("- 学术论文检索用 `search_papers`（不是通用网页搜索——本系统无 search_web 能力）")
+    lines.append("- 纯概念解释、常识、推理、闲聊，且你有把握 → 只用 `answer_direct`，不必检索")
     lines.append("")
 
     lines.append("## 你的任务边界")
@@ -203,7 +165,7 @@ def build_skill_index(has_file: Optional[bool] = None) -> str:
     lines.append("{{")
     lines.append('  "skills": ["search_papers", "write_review", "judge_review"],')
     lines.append('  "topic": "综述主题（answer_direct 时可为空）",')
-    lines.append('  "search_query": "检索关键词（英文，search_papers 和 search_web 都需要；从用户请求中提取核心关键词而非完整句子，用空格分隔；answer_direct 时可为空）",')
+    lines.append('  "search_query": "检索关键词（英文，search_papers 需要；从用户请求中提取核心关键词而非完整句子，用空格分隔；answer_direct 时可为空）",')
     lines.append('  "user_constraints": {{')
     lines.append('      "word_budget": null,            // 用户明说篇幅时填 [下限, 上限]（单位：字），否则 null')
     lines.append('      "required_parts": [],           // 用户点名要包含的部件（如 ["摘要","对比表格"]），没点名则空数组')
@@ -242,7 +204,7 @@ def validate_skills(
     3. judge_review 的前提条件：skills 中必须有 write_review（否则去掉）
     4. answer_direct 与需要外部信息的 skill 冲突 ——
        后者需要运行时上下文，如果同时选了就保留后者（更需要外部信息的一方）
-    5. 有输入类 skill（search_web/search_papers/index_file）但没有任何生成类 skill →
+    5. 有输入类 skill（search_papers/index_file）但没有任何生成类 skill →
        兜底补 answer_from_context（否则抓/查了信息却没人合成答案）
     6. 按执行顺序排列（search_* → index_file → answer*/write → judge）
 
@@ -276,39 +238,25 @@ def validate_skills(
         known.remove("judge_review")
         dropped.add("judge_review")
 
-    # ---- 校验 3b: content_safety 前提 = 需要内容生成 skill ----
-    if "content_safety" in known:
-        has_content_gen = "answer_from_context" in known or "write_review" in known
-        if not has_content_gen:
-            known.remove("content_safety")
-            dropped.add("content_safety")
-
     # ---- 校验 4: answer_direct 冲突消解 ----
     # answer_direct 意味着"不需要外部信息"。如果同时选了需要外部信息的 skill，
-    # 说明模型矛盾了——保留后者（需要 web/paper/file 的那些），去掉 answer_direct。
+    # 说明模型矛盾了——保留后者（需要 paper/file 的那些），去掉 answer_direct。
     needs_context = any(s in known for s in
-                        ("answer_from_context", "write_review", "search_papers", "search_web", "index_file"))
+                        ("answer_from_context", "write_review", "search_papers", "index_file"))
     if "answer_direct" in known and needs_context:
         known.remove("answer_direct")
         dropped.add("answer_direct")
 
     # ---- 校验 5: 有输入无生成 → 兜底补 answer_from_context ----
-    # 如果选了输入类（抓取/检索/索引）但没有任何生成类 skill，信息拿到了却没人合成答案。
-    has_input = any(s in known for s in ("search_web", "search_papers", "index_file"))
+    # 如果选了输入类（检索/索引）但没有任何生成类 skill，信息拿到了却没人合成答案。
+    has_input = any(s in known for s in ("search_papers", "index_file"))
     has_generate = any(s in known for s in ("answer_direct", "answer_from_context", "write_review"))
     if has_input and not has_generate:
         known.append("answer_from_context")
         print("--> [Scheduler] 自动补 answer_from_context（有输入 skill 但缺生成 skill）")
 
-    # ---- 校验 6: 人机审核门 —— write_review + 输入类 skill 时自动插入 ----
-    # 仅当需要"写文稿"且从外部获取信息时才触发。普通问答、纯直接回答不触发。
-    if "write_review" in known and has_input_skill(known) and "human_review" not in known:
-        w_idx = known.index("write_review")
-        known.insert(w_idx, "human_review")
-        print("--> [Scheduler] 自动补 human_review（write_review + 输入类 skill → 审核门）")
-
-    # ---- 校验 7: 按执行顺序排列 ----
-    ORDER = ["search_web", "search_papers", "index_file", "answer_direct", "answer_from_context", "human_review", "write_review", "judge_review", "content_safety", "code_exec", "innovate"]
+    # ---- 校验 6: 按执行顺序排列 ----
+    ORDER = ["search_papers", "index_file", "answer_direct", "answer_from_context", "write_review", "judge_review", "code_exec", "innovate"]
     ordered = [s for s in ORDER if s in known]
     # 把不在 ORDER 里的（如果有）追加到末尾
     ordered += [s for s in known if s not in ORDER]
@@ -334,8 +282,8 @@ def needs_search_papers(skills: list[str]) -> bool:
 
 
 def needs_tools(skills: list[str]) -> bool:
-    """是否需要走 agent 工具循环（联网抓取 / 论文检索 / 代码执行 / 创新实验）"""
-    return ("search_web" in skills or "search_papers" in skills or "code_exec" in skills
+    """是否需要走 agent 工具循环（论文检索 / 代码执行 / 创新实验）"""
+    return ("search_papers" in skills or "code_exec" in skills
             or "innovate" in skills)
 
 
@@ -350,11 +298,96 @@ def needs_content_safety(skills: list[str]) -> bool:
     return "content_safety" in skills
 
 
-def needs_human_review(skills: list[str]) -> bool:
-    """是否需要人机审核门（检索结果给用户过目）"""
-    return "human_review" in skills
-
-
 def has_input_skill(skills: list[str]) -> bool:
-    """是否有输入类 skill（联网/检索论文/索引文件）——需要先从外部获取信息"""
-    return any(s in skills for s in ("search_web", "search_papers", "index_file"))
+    """是否有输入类 skill（检索论文/索引文件）——需要先从外部获取信息"""
+    return any(s in skills for s in ("search_papers", "index_file"))
+
+
+# ==========================================
+# 4. 渐进式披露（L2）：SKILL.md 正文加载
+# ==========================================
+# 对齐 Anthropic Agent Skills 规范：
+#   L1 元数据（name+description）常驻 parse prompt（build_skill_index）
+#   L2 SKILL.md 正文在「触发」（skills 被选中）后注入执行节点（build_skill_instructions）
+#   L3 资源（references/scripts）按需加载：
+#       - references/：详细规格，SKILL.md 正文用「read_file 读取」指针按需加载（模型驱动）
+#       - scripts/：确定性操作实现，运行时不进 LLM 上下文（框架/独立运行调用）
+# 这样流程不再写死在 graph 节点里，改技能流程 = 改 SKILL.md，不动代码。
+
+SKILLS_DIR = Path(__file__).resolve().parents[1] / "skills"  # ResearcherAgent/skills
+
+_skill_body_cache: dict[str, str] = {}
+
+
+def _read_skill_md_body(name: str) -> str:
+    """读 skills/<name>/SKILL.md 的正文（frontmatter 之后的部分）。
+
+    frontmatter 用「首行 --- 到下一个 ---」解析；正文为剩余 markdown。
+    文件缺失或解析失败返回 ""（调用方回退到代码内最小逻辑，不中断流程）。
+    """
+    if name in _skill_body_cache:
+        return _skill_body_cache[name]
+    body = ""
+    p = SKILLS_DIR / name / "SKILL.md"
+    try:
+        raw = p.read_text(encoding="utf-8")
+        m = re.match(r"(?s)^---\s*\r?\n(.*?)\r?\n---\s*\r?\n(.*)$", raw)
+        body = m.group(2).strip() if m else raw.strip()
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        body = ""
+    _skill_body_cache[name] = body
+    return body
+
+
+def load_skill_bodies(skills: list[str]) -> dict[str, str]:
+    """选中 skills 的 SKILL.md 正文（渐进式披露 L2）。
+
+    Returns:
+        {skill_name: 正文}，只含注册表内且正文存在的 skill；缺失项不出现。
+    """
+    return {s: _read_skill_md_body(s) for s in skills if s in SKILL_REGISTRY}
+
+
+def list_skill_resources(name: str) -> list[str]:
+    """列 skills/<name>/references/ 下的文件（L3 资源清单，供提示词生成指针）。"""
+    d = SKILLS_DIR / name / "references"
+    if not d.is_dir():
+        return []
+    return sorted(p.name for p in d.iterdir() if p.is_file() and p.suffix.lower() in (".md", ".txt"))
+
+
+def load_skill_references(name: str) -> str:
+    """读 skills/<name>/references/ 全部资源内容（框架代读，按需注入场景用）。
+
+    Returns:
+        拼接的 markdown；无 references 目录或读取失败返回 ""。
+    """
+    files = list_skill_resources(name)
+    if not files:
+        return ""
+    parts = []
+    for f in files:
+        try:
+            text = (SKILLS_DIR / name / "references" / f).read_text(encoding="utf-8")
+            parts.append(f"## 参考资料 {name}/references/{f}\n\n{text.strip()}")
+        except (FileNotFoundError, OSError, UnicodeDecodeError):
+            continue
+    return "\n\n".join(parts)
+
+
+def build_skill_instructions(skills: list[str]) -> str:
+    """渲染「已选技能执行规范」区块，注入 agent / write / judge / safety 等节点 system prompt。
+
+    每个被选中的 skill 若存在 SKILL.md，其正文即为该能力的标准操作流程——
+    LLM 按此执行，而不是依赖代码里写死的步骤描述。无正文时返回空串。
+    """
+    bodies = load_skill_bodies(skills)
+    parts = []
+    for s in skills:
+        b = bodies.get(s)
+        if b:
+            parts.append(f"## 技能执行规范 · {s}\n{b}")
+    if not parts:
+        return ""
+    return ("\n\n### 📋 已选技能执行规范（严格按各技能 SKILL.md 的流程与规则执行，"
+            "与本提示其他内容冲突时以技能规范为准）\n\n" + "\n\n".join(parts))

@@ -153,7 +153,7 @@ def flatten(topic_seeds: list[dict]) -> list[dict]:
 
 
 if __name__ == "__main__":
-    t = sys.argv[1] if len(sys.argv) > 1 else "时序预测"
+    t = sys.argv[1] if len(sys.argv) > 1 else "时序预测"  # 示例默认，实际使用传入任意领域主题
     res = generate(t)
     flat = flatten(res)
     print(f"\n{t} 子主题数: {len(res)}｜种子总数: {len(flat)}")

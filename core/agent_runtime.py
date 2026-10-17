@@ -3,14 +3,12 @@ agent_runtime.py
 ================
 AgentRuntime — 全局 Agent 持有者，服务启动时初始化一次，后续请求复用。
 
-拓扑（研究阶段 = 模型驱动的 ReAct 循环；外层只保留 HITL 门 / 质量门 / 护栏）：
+拓扑（研究阶段 = 模型驱动的 ReAct 循环；外层只保留质量门 / 护栏）：
     parse ─┬→ simple_chat ───────────────────────────────→ save
            ├→ process_file → file_qa ─┬→ write → judge …
            │                          └→ save
            └→ agent ⟲ tools
-                 └→(模型不再调工具)─┬→ nudge_ask_user → agent   （写综述前必须 ask_user，只提醒一次）
-                                   ├→ write → judge ─┬→ save / content_safety
-                                   │                  └→ increment_rewrite → write
+                 └→(模型不再调工具)─┬→ write → judge → save / content_safety（单次评审直接交付，不重写不补检）
                                    └→ answer ─┬→ save
                                               └→ content_safety → increment_content_safety ─┬→ write
                                                                                            └→ safety_feedback → agent
@@ -36,14 +34,13 @@ from ResearcherAgent.core.graph_nodes import (
     parse_intent_node,
     simple_chat_node,
     make_agent_node,
-    nudge_ask_user_node,
     answer_node,
     content_safety_feedback_node,
     write_review_node,
     judge_review_node,
+    async_judge_node,
     content_safety_node,
     increment_rewrite_node,
-    increment_re_research_node,
     increment_content_safety_node,
     save_node,
     reject_node,
@@ -302,7 +299,7 @@ class AgentRuntime:
         async def _parse(state):       return await parse_intent_node(state, self.llm_of("router"))
         async def _simple_chat(state): return await simple_chat_node(state, self.llm_of("router"))
         def _write(state):             return write_review_node(state, self.llm_of("writer"))
-        def _judge(state):             return judge_review_node(state, self.llm_of("judge"))
+        def _judge(state):             return async_judge_node(state, self.llm_of("judge"))
         def _content_safety(state):    return content_safety_node(state, self.llm_of("safety"))
         async def _file_qa(state):     return await file_qa_node(state, self.llm_of("agent"))
         def _proc_file(state):         return _process_file_impl(state, self.llm_of("router"))
@@ -315,14 +312,12 @@ class AgentRuntime:
                           make_agent_node(self.llm_of("agent"), self.mcp_tools, self.local_tools),
                           retry_policy=LLM_RETRY)
         workflow.add_node("tools", ToolNode(self.tools))
-        workflow.add_node("nudge_ask_user", nudge_ask_user_node)
         workflow.add_node("answer", answer_node)
         workflow.add_node("safety_feedback", content_safety_feedback_node)
         workflow.add_node("write", _write, retry_policy=LLM_RETRY)
         workflow.add_node("judge", _judge, retry_policy=LLM_RETRY)
         workflow.add_node("content_safety", _content_safety, retry_policy=LLM_RETRY)
         workflow.add_node("increment_rewrite", increment_rewrite_node)
-        workflow.add_node("increment_re_research", increment_re_research_node)
         workflow.add_node("increment_content_safety", increment_content_safety_node)
         workflow.add_node("reject", reject_node)
         workflow.add_node("save", save_node)
@@ -345,30 +340,23 @@ class AgentRuntime:
         # ★ 模型驱动的 ReAct 循环：agent ⟲ tools；模型不再调用工具即终止研究阶段
         workflow.add_conditional_edges("agent", route_after_agent, {
             "tools": "tools",
-            "nudge_ask_user": "nudge_ask_user",
             "write": "write",
             "answer": "answer",
             "reject": "reject",
         })
         workflow.add_edge("tools", "agent")
-        workflow.add_edge("nudge_ask_user", "agent")
 
         # answer → content_safety（如有）或 save
         workflow.add_conditional_edges("answer", _route_after_answer, {
             "content_safety": "content_safety", "save": "save",
         })
 
-        # Harness 评委-重写循环（学术质量，强制质量门）
+        # Harness 评委-质量门（学术质量，单次评审直接交付：不重写、不补检索）
         workflow.add_edge("write", "judge")
         workflow.add_conditional_edges("judge", route_after_judge, {
             "content_safety": "content_safety", "save": "save",
-            "increment_rewrite": "increment_rewrite",
-            # ⚠️ 必须经 increment_re_research 计数再进 agent：这条边不经过
-            #    increment_rewrite，不计数 judge 就会无限重跑（见 config.MAX_RE_RESEARCH）
-            "agent": "increment_re_research",
         })
         workflow.add_edge("increment_rewrite", "write")
-        workflow.add_edge("increment_re_research", "agent")
 
         # 内容安全审核循环
         workflow.add_conditional_edges("content_safety", route_after_content_safety, {
@@ -410,8 +398,7 @@ NODE_LABELS = {
     "parse":               "🧭 正在理解意图并选择技能...",
     "simple_chat":         "💬 正在回答...",
     "agent":               "🤔 Agent 正在思考下一步...",
-    "tools":               "🔧 正在执行工具（检索 / 规划 / 覆盖度 / 精读）...",
-    "nudge_ask_user":      "📋 准备提交审核...",
+    "tools":               "🔧 正在执行工具（检索 / 规划 / 精读）...",
     "answer":              "🤖 正在整理回答...",
     "safety_feedback":     "🔄 [safety] 根据安全反馈重答...",
     "write":               "✍️ 正在撰写综述...",

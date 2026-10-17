@@ -42,6 +42,7 @@ from ResearcherAgent.core import tracing
 from ResearcherAgent.sandbox import code_executor as ce
 from ResearcherAgent.sandbox.sandbox_exec import PROJECT_ROOT, get_env
 from ResearcherAgent.memory import cc_memory
+from ResearcherAgent.retrieval.fulltext import fetch_arxiv_fulltext
 
 # ---------------------------------------------------------------------------
 # 常量
@@ -138,18 +139,22 @@ def _write_cache(cache: dict):
 
 
 def _ensure_dataset(dataset: str) -> str:
-    """确保数据集已拷贝进沙箱工作区，返回工作区内的数据目录（相对 workspace 根）。"""
-    probe = ce.execute_command.invoke({"command": f'dir /b "datasets\\{dataset}" 2>nul'})
-    if "ETTh1.csv" not in probe:
-        src_abs = os.path.join(PROJECT_ROOT, "datasets", dataset, "ETTh1.csv")
-        if os.path.exists(src_abs):
-            ce.execute_command.invoke({"command": (
-                f'if not exist "datasets\\{dataset}" mkdir "datasets\\{dataset}" && '
-                f'copy /Y "{src_abs}" "datasets\\{dataset}\\"')})
-        else:
-            # 尝试工作区内已有副本
-            ce.execute_command.invoke({"command": (
-                f'if not exist "datasets\\{dataset}" mkdir "datasets\\{dataset}"')})
+    """确保数据集已拷贝进沙箱工作区，返回工作区内的数据目录（相对 workspace 根）。
+
+    领域无关：拷贝 datasets/{dataset}/ 下**全部数据文件**（不再写死 ETTh1.csv）；
+    具体用哪个文件由基线/实验脚本的 EXEC_ARGS 决定。
+    """
+    import glob as _glob
+    src_dir = os.path.join(PROJECT_ROOT, "datasets", dataset)
+    # 本机源目录存在且非空 → 整目录同步进沙箱（copy /Y 幂等）
+    if os.path.isdir(src_dir) and _glob.glob(os.path.join(src_dir, "*")):
+        ce.execute_command.invoke({"command": (
+            f'if not exist "datasets\\{dataset}" mkdir "datasets\\{dataset}" && '
+            f'copy /Y "{src_dir}\\*" "datasets\\{dataset}\\"')})
+    else:
+        # 源目录不在本机（可能只存在于沙箱内）→ 仅确保目录存在
+        ce.execute_command.invoke({"command": (
+            f'if not exist "datasets\\{dataset}" mkdir "datasets\\{dataset}"')})
     return f"datasets/{dataset}"
 
 
@@ -213,9 +218,12 @@ def _experiences_context(n: int = _EXP_TAIL_N) -> str:
 
 # ---------------------------------------------------------------------------
 # PatchTST 基线脚本（自包含模板，写入沙箱后运行）
+# ⚠️ 领域说明：PatchTST/ETT/滑窗是**时序领域的演示默认基线**；
+#    其他领域由 implement_innovation 的 LLM 按主题上下文生成对应基线，本模板仅作参考骨架。
 # ---------------------------------------------------------------------------
 BASELINE_PY = r'''# -*- coding: utf-8 -*-
 """PatchTST 基线（ICLR 2023, "A Time Series is Worth 64 Words"）—— 自包含。
+时序领域演示默认基线；其他领域按实验主题替换数据加载/模型/指标部分。
 参数经环境变量 EXEC_ARGS 传入（格式: |data_dir|seq_len|pred_len|epochs），缺省用默认值。
 输出: 每 epoch 一行日志 + 末尾一行 METRIC_JSON={...}
 """
@@ -235,7 +243,13 @@ PRED_LEN = int(_args[3]) if len(_args) > 3 else 96
 EPOCHS = int(_args[4]) if len(_args) > 4 else 50
 _PROJ = os.path.dirname(os.path.abspath(__file__))
 DATA_DIR = _args[1] if len(_args) > 1 else os.path.join(_PROJ, "..", "datasets", "ETTH1")
-CSV = os.path.join(DATA_DIR, "ETTh1.csv")
+# 数据文件自动匹配：优先 ETTh1.csv（时序演示默认），否则取目录内第一个 CSV（领域无关）
+import glob as _glob
+_CSV_CAND = os.path.join(DATA_DIR, "ETTh1.csv")
+if not os.path.exists(_CSV_CAND):
+    _found = _glob.glob(os.path.join(DATA_DIR, "*.csv"))
+    _CSV_CAND = _found[0] if _found else _CSV_CAND
+CSV = _CSV_CAND
 PATCH_LEN, STRIDE = 16, 8
 D_MODEL, N_HEADS, N_LAYERS, D_FF, DROPOUT = 16, 4, 3, 128, 0.2
 BATCH, LR = 128, 0.001
@@ -355,7 +369,132 @@ print("METRIC_JSON=" + json.dumps(metric, ensure_ascii=False))
 # 1. deep_survey —— 原子学术定义拆解 + 论文公式提取（照搬 AI-Researcher Paper Survey Agent）
 #    输入论文卡片，把研究主题拆成可实现的「原子学术定义」，逐一定义提取数学公式/理论基础，
 #    输出 state.survey_notes，作为 propose_innovations 的公式级输入。
+#
+# 升级（PDF 导航精读等价）：拆解完成后，对每个定义去来源论文**原文**（ar5iv 结构化全文，
+# 保留 LaTeX 公式）中定位精确公式并回填——不再只依赖精读卡片（卡片压缩可能丢公式细节）。
 # ---------------------------------------------------------------------------
+_ARXIV_ID_RE = re.compile(r"(\d{4}\.\d{4,5})")
+
+def _extract_arxiv_id(s: str) -> str:
+    m = _ARXIV_ID_RE.search(s or "")
+    return m.group(1) if m else ""
+
+_PAPER_NOTES_SYS = (
+    "你是科研精读专家。下面是论文《{title}》的完整全文（含 LaTeX 公式，形如 $...$ 或 \\[ ... \\]）。\n"
+    "请**通读全文、边读边理解**，提取该论文中最值得作为「创新点构建基石」的原子学术定义。\n"
+    "原子学术定义的标准：\n"
+    "1) 单个自包含概念——示例（仅示意「单个概念」的含义，领域变通，不要照抄）："
+    "『Patch 嵌入与通道独立注意力』『可分解注意力』『频域损失项』；"
+    "不要合并多个概念；\n"
+    "2) 有明确的数学形式——公式必须**原样照抄全文**（LaTeX 或文字公式），并标注出处章节；\n"
+    "3) 可被代码实现——给出实现要点（伪代码/张量形状/关键变换/损失项）；\n"
+    "4) 只提取该论文**确实提出或详细论述**的概念，不要泛泛的背景概念。\n"
+    "直接输出 1-4 个定义的 JSON 数组，**不要复述格式说明**。字段：\n"
+    '   [{{"definition": "原子学术定义", "math_formula": "原样公式（LaTeX）", '
+    '"theory": "理论基础（2-3 句）", "code_hints": "实现要点（伪代码/张量形状）", '
+    '"section": "公式出处章节"}}]'
+)
+
+def _read_paper_notes(llm, aid: str, title: str, session_id: str) -> list[dict]:
+    """单篇论文全文结构化精读：通读全文 → 一次提取该论文的全部原子定义（公式原样照抄）。
+
+    读全文不再截断式取前 20000 字符（那会漏掉靠后章节的公式，如 FEDformer §3.3）；
+    ar5iv 全文上限放宽到 80000 字符、单节 8000，覆盖绝大多数论文正文。
+    失败/无全文返回空列表（由调用方降级）。
+    """
+    ft = fetch_arxiv_fulltext(aid, max_chars=80000, section_max=8000)
+    if len(ft) < 500:
+        print(f"    [deep_survey] 《{str(title)[:28]}》arXiv {aid} 无全文，降级卡片提取")
+        return []
+    user = (f"论文《{title}》（arXiv:{aid}）完整全文如下：\n\n{ft[:80000]}")
+    try:
+        with tracing.span("llm", "deep_survey_paper_read", session_id, id=aid):
+            resp = llm.invoke([SystemMessage(content=_PAPER_NOTES_SYS.format(title=title)),
+                               HumanMessage(content=user)])
+        raw_txt = resp.content if hasattr(resp, "content") else str(resp)
+        data = _extract_json_block(raw_txt)
+        if not isinstance(data, list):
+            print(f"    [deep_survey] 《{str(title)[:28]}》未返回定义 JSON，跳过")
+            return []
+        out = []
+        for d in data[:4]:
+            if not isinstance(d, dict) or not d.get("definition"):
+                continue
+            out.append({
+                "definition": str(d.get("definition") or "").strip()[:120],
+                "math_formula": str(d.get("math_formula") or "").strip()[:800],
+                "theory": str(d.get("theory") or "").strip()[:400],
+                "code_hints": str(d.get("code_hints") or "").strip()[:500],
+                "reference_papers": [str(title).strip()],
+                "arxiv_id": aid,
+                "section": str(d.get("section") or "").strip()[:80],
+                "formula_source": f"arXiv:{aid} 原文精读",
+            })
+        print(f"    [deep_survey] 《{str(title)[:28]}》全文精读 → {len(out)} 个定义（arXiv:{aid}）")
+        return out
+    except Exception as e:
+        print(f"    [deep_survey] 《{str(title)[:28]}》精读失败：{type(e).__name__}: {str(e)[:120]}")
+        return []
+
+def _norm_def(s: str) -> str:
+    """定义名归一化（去空白/标点/大小写），用于跨论文聚合去重。"""
+    return re.sub(r"[\s\u3000:：,，.。()（）\-_/“”\"']+", "", s or "").lower()[:60]
+
+def _merge_notes(all_notes: list[dict], max_definitions: int) -> list[dict]:
+    """跨论文聚合：同义定义合并（保留多个来源、互补公式），输出上限 max_definitions。"""
+    merged: list[dict] = []
+    for n in all_notes:
+        k = _norm_def(n.get("definition", ""))
+        if not k:
+            continue
+        hit = None
+        for m in merged:
+            mk = _norm_def(m.get("definition", ""))
+            if k == mk or (len(k) >= 6 and (k in mk or mk in k)):
+                hit = m
+                break
+        if hit:
+            src = n.get("reference_papers") or []
+            if src and src[0] not in (hit.get("reference_papers") or []):
+                hit.setdefault("reference_papers", []).append(src[0])
+            if not hit.get("math_formula") and n.get("math_formula"):
+                hit["math_formula"] = n["math_formula"]
+        else:
+            merged.append(dict(n))
+    return merged[:max_definitions]
+
+def _cards_fallback_notes(llm, cards: list, theme: str, session_id: str) -> list[dict]:
+    """降级路径：无论文可读全文时，从精读卡片提取定义（老逻辑）。"""
+    ctx = _cards_context(cards)
+    sys = (
+        "你是理论功底扎实的科研调研专家。任务：把研究主题拆解为若干「原子学术定义」。\n"
+        "原子学术定义的标准：\n"
+        "1) 单个自包含概念——示例（仅示意「单个概念」的含义，领域变通，不要照抄）："
+        "『Patch 嵌入与通道独立注意力』『可分解注意力』『频域损失项』；"
+        "不要合并多个概念；\n"
+        "2) 有明确的数学形式（公式/伪代码/变换定义）；\n"
+        "3) 可被代码实现（PyTorch 可写）；\n"
+        "4) 可追溯到具体论文。\n"
+        "对每个定义，从给定的论文精读卡片（含原文段落证据）中提取：数学公式、理论基础、"
+        "来源论文、实现要点提示。卡片中没有明确公式的定义，基于卡片内容做忠实归纳并标注"
+        "『（卡片未给公式，基于描述归纳）』。\n"
+        "只输出一个 JSON 数组，字段：\n"
+        '   [{"definition": "原子学术定义", "math_formula": "数学公式（LaTeX 或文字公式）", '
+        '"theory": "理论基础（2-3 句）", "reference_papers": ["来源论文"], '
+        '"code_hints": "实现要点（结构/张量形状/损失项）"}]'
+    )
+    try:
+        with tracing.span("llm", "deep_survey_card_fallback", session_id, id="cards"):
+            resp = llm.invoke([SystemMessage(content=sys),
+                               HumanMessage(content=f"研究主题：{theme}\n\n论文精读卡片：\n{ctx}")])
+        data = _extract_json_block(resp.content if hasattr(resp, "content") else str(resp))
+        if not isinstance(data, list):
+            return []
+        return [d for d in data if isinstance(d, dict) and d.get("definition")]
+    except Exception as e:
+        print(f"    [deep_survey] 卡片降级提取失败：{type(e).__name__}: {str(e)[:120]}")
+        return []
+
 def make_deep_survey(llm):
     @tool
     def deep_survey(
@@ -363,12 +502,14 @@ def make_deep_survey(llm):
         state: Annotated[dict, InjectedState],
         topic: str | None = None,
         max_definitions: int = 6,
+        max_papers: int = 5,
     ) -> Command:
-        """深度调研：把研究主题拆解为原子学术定义，并从论文卡片中提取每个定义的数学公式与理论。
+        """深度调研：对已精读论文做「全文结构化精读」——通读每篇论文原文，
+        一次提取该论文的原子学术定义（公式原样照抄 + 代码实现线索），跨论文聚合去重。
 
         适用：read_papers/read_sections 精读完成、paper_cards 已有卡片后调用（在 propose_innovations 之前）。
-        输出写入 state.survey_notes（definition / math_formula / theory / reference_papers / code_hints），
-        让后续创新点提出建立在「公式级理解」之上，而不是泛泛的论文要点。
+        输出写入 state.survey_notes（definition / math_formula / theory / reference_papers /
+        code_hints / formula_source / section），让后续创新点提出建立在「原文公式级理解」之上。
         """
         cards = state.get("paper_cards") or []
         if not cards:
@@ -376,37 +517,45 @@ def make_deep_survey(llm):
                 content="paper_cards 为空：请先调用 read_papers（精读 5-10 篇）再做深度调研。",
                 tool_call_id=tool_call_id, status="error")]})
         theme = topic or state.get("topic") or state.get("user_request") or "该领域"
-        ctx = _cards_context(cards)
-        sys = (
-            "你是理论功底扎实的科研调研专家。任务：把研究主题拆解为若干「原子学术定义」。\n"
-            "原子学术定义的标准：\n"
-            "1) 单个自包含概念（如『Patch 嵌入与通道独立注意力』『可分解注意力』『频域损失项』），"
-            "不要合并多个概念；\n"
-            "2) 有明确的数学形式（公式/伪代码/变换定义）；\n"
-            "3) 可被代码实现（PyTorch 可写）；\n"
-            "4) 可追溯到具体论文。\n"
-            "对每个定义，从给定的论文精读卡片（含原文段落证据）中提取：数学公式、理论基础、"
-            "来源论文、实现要点提示。卡片中没有明确公式的定义，基于卡片内容做忠实归纳并标注"
-            "『（卡片未给公式，基于描述归纳）』。\n"
-            f"只输出一个 JSON 数组（3-{max_definitions} 个元素），字段：\n"
-            '   [{"definition": "原子学术定义", "math_formula": "数学公式（LaTeX 或文字公式）", '
-            '"theory": "理论基础（2-3 句）", "reference_papers": ["来源论文"], '
-            '"code_hints": "实现要点（结构/张量形状/损失项）"}]]'
-        )
-        user = f"研究主题：{theme}\n\n论文精读卡片：\n{ctx}"
-        with tracing.span("llm", "deep_survey", state.get("session_id", "")):
-            resp = llm.invoke([SystemMessage(content=sys), HumanMessage(content=user)])
-        data = _extract_json_block(resp.content if hasattr(resp, "content") else str(resp))
-        if not isinstance(data, list) or not data:
+        session_id = state.get("session_id", "")
+
+        # 1) 按 arXiv id 去重选论文（无 id 的卡片也保留，走降级）
+        papers, seen_ids = [], set()
+        for c in cards:
+            aid = _extract_arxiv_id(str(c.get("id") or ""))
+            if aid and aid in seen_ids:
+                continue
+            if aid:
+                seen_ids.add(aid)
+            papers.append({"aid": aid, "title": (c.get("title") or "").strip() or "论文",
+                           "card": c})
+        papers = papers[:max_papers]
+
+        # 2) 全文结构化精读（主路径）
+        all_notes = []
+        for p in papers:
+            if p["aid"]:
+                all_notes.extend(_read_paper_notes(llm, p["aid"], p["title"], session_id))
+        # 3) 主路径产出不足 → 降级：从卡片提取
+        if not all_notes:
+            print("    [deep_survey] 无可精读全文，降级从精读卡片提取定义")
+            notes = _cards_fallback_notes(llm, cards, theme, session_id)
+        else:
+            notes = _merge_notes(all_notes, max_definitions)
+
+        if not notes:
             return Command(update={"messages": [ToolMessage(
-                content="模型未返回有效 survey_notes JSON，请重试或调整精读范围。",
+                content="深度调研未产出有效原子定义（全文/卡片均失败），请重试或调整精读范围。",
                 tool_call_id=tool_call_id, status="error")]})
-        notes = data[: max_definitions] if max_definitions >= 3 else data
-        lines = [f"深度调研完成：拆解出 {len(notes)} 个原子学术定义："]
+
+        lines = [f"深度调研完成：全文精读 {len(papers)} 篇论文，聚合出 {len(notes)} 个原子学术定义："]
         for i, d in enumerate(notes, 1):
-            formula = (d.get("math_formula") or "")[:90]
-            lines.append(f"{i}. {d.get('definition', '未命名')}")
+            formula = (d.get("math_formula") or "")[:80]
+            src = d.get("formula_source") or "〔卡片归纳〕"
+            lines.append(f"{i}. {d.get('definition', '未命名')}（{src}）")
             lines.append(f"   公式：{formula}")
+            if d.get("section"):
+                lines.append(f"   出处：{d.get('section')}")
         lines.append("")
         lines.append("👉 下一步：调用 propose_innovations —— 它将基于这些公式级笔记"
                      "生成 5 个结构化创新点方案并择优增强。")
@@ -454,8 +603,9 @@ def make_propose_innovations(llm):
             "你是科研方法论创新专家。基于给定的深度调研笔记（含原子定义与数学公式）与论文卡片，"
             "为研究主题生成多个**结构化创新点方案**。\n"
             "要求：\n"
-            "1) 创新点必须具体可实现：基于 PyTorch、可直接在长序列时间序列预测管线"
-            "（多变量，60/20/20 划分）上实现并对比基线（PatchTST）。\n"
+            "1) 创新点必须具体可实现：基于 PyTorch、可直接在**该领域的标准实验管线**上实现"
+            "（数据划分/基线模型由主题上下文给定；若无显式基线，从精读论文中最常被对比的模型中选一个作基线，"
+            "并在方案里写明用哪个基线、在什么数据集上对比、用什么指标）。\n"
             "2) 每个方案必须给出：挑战（现有方法瓶颈）、现有方法、动机、具体方法（结构/训练改动）、"
             "数学公式（尽可能完整）、预期结果、基于哪些论文、难度。\n"
             "3) 至少 1 个低难度（数据/训练层面小改动）、至少 1 个中高难度（结构创新）。\n"
@@ -894,12 +1044,14 @@ _NOVELTY_HIT_MAX = 4            # 每个检索式每源取前 N 条
 _NOVELTY_ABSTRACT_CHARS = 280   # 命中论文摘要注入 LLM 的截断长度
 
 
-def _rule_queries(entry: dict) -> list[str]:
-    """规则兜底检索式（LLM 生成失败时用）：名称 + 领域词。"""
+def _rule_queries(entry: dict, topic: str = "") -> list[str]:
+    """规则兜底检索式（LLM 生成失败时用）：名称 + 领域词（从主题/上下文中取，不再写死时序）。"""
     name = (entry.get("name") or "").strip()
     method = (entry.get("method") or "").strip()
-    base = name or method[:40] or "time series forecasting"
-    return [base + " time series forecasting", base]
+    base = name or method[:40]
+    if not base:
+        base = (topic or "research").strip()[:40] or "research"
+    return [base, base]  # 领域限定由 LLM 检索式承担；规则兜底只保证非空
 
 
 async def _build_search_queries(llm, targets: list[dict], session_id: str) -> dict:
@@ -911,7 +1063,7 @@ async def _build_search_queries(llm, targets: list[dict], session_id: str) -> di
     sys = (
         "你是科研检索专家。为每个创新点生成 **2 个英文检索式**，用于在学术库（OpenAlex/arXiv/Crossref/"
         "EuropePMC）中查找**可能已提出过该创新点**的文献。检索式应包含核心方法术语（结构/训练/损失改动），"
-        "不要过于宽泛（如只有 'time series'），也不要带引号/操作符。\n"
+        "不要过于宽泛（如只有领域最泛的上位词，示例：时序领域的 'time series'），也不要带引号/操作符。\n"
         '只输出 JSON 对象：{"<id>": ["query1", "query2"], ...}'
     )
     try:
@@ -1126,14 +1278,15 @@ def run_baseline(
     pred_len: int = 96,
     epochs: int = 50,
 ) -> str:
-    """运行基线模型（PatchTST）在指定数据集上训练并返回评估指标。
+    """运行基线模型，在指定数据集上训练并返回评估指标。
 
     基线脚本（project/baseline_patchtst.py）首次调用时自动写入沙箱工作区；
     数据从项目 datasets/ 拷入沙箱。同一 (dataset, seq_len, pred_len, epochs)
     的结果会缓存（.baseline_cache.json），再次调用直接返回缓存。
 
-    dataset：数据集目录名（ETTH1/ETTH2/ETTm1...，对应 datasets/{dataset}/ETTh*.csv）；
-    seq_len：回看窗口（默认 336）；pred_len：预测长度（默认 96）；epochs：训练轮数（默认 50）。
+    dataset：数据集目录名（默认演示：ETTH1/ETTH2/ETTm1...，对应 datasets/{dataset}/ 下数据文件；
+    其他领域可指定任意数据集目录）；seq_len/pred_len：回看/预测窗口（时序演示默认 336/96，
+    其他领域按领域惯例解释或忽略）；epochs：训练轮数（默认 50）。
     """
     data_dir = _ensure_dataset(dataset)
     cache_key = f"{dataset}|{seq_len}|{pred_len}|{epochs}"
@@ -1208,28 +1361,29 @@ def make_implement_innovation(llm):
         probe = ce.read_file.invoke({"file_path": base_path})
         baseline_hint = ("基线脚本位于 project/baseline_patchtst.py，数据加载/训练骨架可整体复制。"
                          if not probe.startswith("Error reading file") else
-                         "（基线脚本尚未生成，请按标准 ETT 数据管线自写数据加载："
-                         "60/20/20 划分 + train 统计量标准化 + 滑窗样本。）")
+                         "（基线脚本尚未生成，请按**该领域标准实验管线**自写数据加载："
+                         "时序 = 60/20/20 划分 + train 统计量标准化 + 滑窗样本；其他领域按领域惯例变通。）")
         exp_ctx = cc_memory.inject_context()
 
+        # 渐进式披露 L2：实验代码硬性要求来自 innovate/SKILL.md，不再写死在工具里
+        from ResearcherAgent.core.skill_manager import load_skill_bodies
+        _innov_skill = load_skill_bodies(["innovate"]).get("innovate", "")
         sys = (
             "你是深度学习科研工程师。根据给定的创新点，编写一个**完整、可直接运行**的 PyTorch "
-            "实验脚本，验证该创新点相对基线模型（PatchTST）的精度提升。\n"
-            "硬性要求：\n"
-            "1) 输出**单一 Python 文件**，不要输出多个文件或解释文字（可附在注释里）。\n"
-            "2) 数据管线必须与基线一致：读 {CSV}，60/20/20 划分（train/val/test），"
-            "用 train 统计量标准化，滑窗样本 (seq_len={seq_len}, pred_len={pred_len})，"
-            "batch=128，Adam lr=0.001，MSE loss。\n"
-            "3) 必须实现基线 PatchTST 作为对照骨架（从基线脚本复制模型定义，可整体保留），"
-            "然后在其上实现创新点改动。**同一份脚本里同时训练基线版与创新版**，"
-            "确保对比公平（相同数据划分/超参/epochs）。\n"
-            "4) 每轮打印日志；最后打印两行：\n"
-            '   BASELINE_JSON={{"mse":..., "mae":...}}\n'
-            '   METRIC_JSON={{"mse":..., "mae":..., "device":..., "epochs":..., "name": "创新点名称"}}\n'
-            "5) 参数从环境变量 EXEC_ARGS 读取（格式 |data_dir|seq_len|pred_len|epochs，"
-            "以 | 分隔），脚本需容忍缺省（缺省 seq_len=336, pred_len=96, epochs=50）。\n"
-            "6) 只使用 torch / numpy / pandas，不依赖未安装的库。\n"
-            "7) 已知踩坑经验（避免重犯；与本创新点无关可忽略）：\n"
+            "实验脚本，验证该创新点相对**基线模型**（由 run_baseline 或参考代码库确定；"
+            "默认演示示例：时序领域为 PatchTST，其他领域按上下文选常用基线）的精度提升。\n"
+            + (_innov_skill if _innov_skill else
+               "（技能规范缺失——遵循该领域标准实验约定：单一文件 / 数据划分与标准化按领域惯例 / "
+               "同一脚本同时训练基线与创新版 / 标准化尺度上算指标 / 末尾输出 BASELINE_JSON 与 "
+               "METRIC_JSON / EXEC_ARGS 读参数。）")
+            + "\n按「技能执行规范 · innovate」的「实验代码硬性要求」执行（数据管线/评估口径/输出契约）。"
+            "本次具体参数由 EXEC_ARGS 与下方配置给定（时序演示默认：读 CSV，滑窗 "
+            "(seq_len={seq_len}, pred_len={pred_len})，batch=128，Adam lr=0.001，MSE loss，epochs={epochs}；"
+            "其他领域按领域惯例调整数据加载与指标）；同一脚本同时训练基线版与创新版"
+            "（同数据划分/超参/epochs 保证公平）；参数从环境变量 EXEC_ARGS 读取"
+            "（|data_dir|seq_len|pred_len|epochs，容忍缺省 336/96/50）；末尾打印两行 "
+            "BASELINE_JSON / METRIC_JSON。\n"
+            "已知踩坑经验（避免重犯；与本创新点无关可忽略）：\n"
             f"{exp_ctx or '（暂无）'}"
         )
         cs_reports = state.get("code_survey_reports") or {}
@@ -1241,7 +1395,8 @@ def make_implement_innovation(llm):
             )
         user = (
             f"创新点（id={innovation_id}）：\n{json.dumps(innov, ensure_ascii=False, indent=1)}\n\n"
-            f"数据集：{dataset}（CSV={data_dir}/ETTh1.csv）\n"
+            f"数据集：{dataset}（数据目录={data_dir}，具体文件由脚本按 EXEC_ARGS/领域约定读取；"
+            f"时序演示默认 datasets/{dataset} 下的 CSV）\n"
             f"配置：seq_len={seq_len}, pred_len={pred_len}, epochs={epochs}\n"
             f"{baseline_hint}{cs_hint}\n"
             f"请直接输出完整 Python 代码。"
@@ -1317,7 +1472,8 @@ def make_judge_innovation(llm):
         tool_call_id: Annotated[str, InjectedToolCallId],
         state: Annotated[dict, InjectedState],
     ) -> Command:
-        """对比创新点实验指标与基线（PatchTST）指标，判断该创新点是否可行。
+        """对比创新点实验指标与基线（run_baseline 缓存，默认演示：PatchTST）指标，
+        判断该创新点是否可行。
 
         innovation_id：创新点 id（须先 implement_innovation 跑出实验指标）。
         基线指标从 run_baseline 的缓存读取；没有缓存则提示先跑基线。
@@ -1342,13 +1498,19 @@ def make_judge_innovation(llm):
                         f"dataset={dataset} seq_len={seq_len} pred_len={pred_len} epochs={epochs}。",
                 tool_call_id=tool_call_id, status="error")]})
 
+        # 渐进式披露 L2：判定标准来自 innovate/SKILL.md，不再写死在工具里
+        from ResearcherAgent.core.skill_manager import load_skill_bodies
+        _innov_skill = load_skill_bodies(["innovate"]).get("innovate", "")
         sys = (
-            "你是严格的科研实验评审。对比创新点实验与基线（PatchTST）的指标，判断该创新点"
-            "是否构成**可行的改进**。判断标准：\n"
-            "1) 相对提升：创新版 MSE 相比基线是否下降、下降多少（(base-exp)/base）；"
-            "下降 5% 以上且 MAE 同步改善 → 可行；0~5% → 存疑；不降反升 → 不可行。\n"
-            "2) 训练是否稳定收敛（日志有无 NaN/发散）。\n"
-            "3) 实现是否忠实于创新点描述、对比是否公平（同数据/同 epochs/同超参）。\n"
+            "你是严格的科研实验评审。对比创新点实验与基线（run_baseline 产出的基线指标，"
+            "默认演示为 PatchTST，其他领域为所选常用基线）的指标，判断该创新点"
+            "是否构成**可行的改进**。\n\n"
+            + (_innov_skill if _innov_skill else
+               "（技能规范缺失——判断标准：创新版主指标（如 MSE/MAE 或该领域标准指标）相对基线"
+               "下降 ≥5% 且辅助指标同步改善 → 可行；0~5% → 存疑；不降反升 → 不可行。）")
+            + "\n按「技能执行规范 · innovate」的「判定标准」执行（相对提升 (base-exp)/base ≥5% 且主指标 "
+            "同步改善 → 可行；0~5% 存疑；不降反升 → 不可行），并核查：训练是否稳定收敛（日志有无 NaN/"
+            "发散）；实现是否忠实于创新点描述；对比是否公平（同数据/同 epochs/同超参）。\n"
             "只输出一个 JSON 对象，字段：\n"
             '   {"id": "...", "feasible": true|false, "gain": "相对基线MSE提升百分比(带正负号)", '
             '"basis": "判断依据（100字内）", "risks": "风险/局限", "suggestion": "下一步建议"}\n'
@@ -1425,7 +1587,7 @@ def make_fix_and_rerun(llm):
                         f"生成 {innovation_id} 的代码。",
                 tool_call_id=tool_call_id, status="error")]})
 
-        dataset = rec.get("dataset", "ETTH1")
+        dataset = rec.get("dataset", "dataset")
         seq_len = int(rec.get("seq_len", 336))
         pred_len = int(rec.get("pred_len", 96))
         epochs = int(rec.get("epochs", 50))
@@ -1436,16 +1598,23 @@ def make_fix_and_rerun(llm):
 
         for attempt in range(1, max(1, min(int(max_attempts), 5)) + 1):
             attempts_done = attempt
+            # 渐进式披露 L2：实验硬性要求来自 innovate/SKILL.md，工具只保留解析契约
+            from ResearcherAgent.core.skill_manager import load_skill_bodies
+            _innov_skill = load_skill_bodies(["innovate"]).get("innovate", "")
             sys = (
                 "你是科研代码调试工程师。给定创新点实验脚本及其最近一次运行的错误日志，"
                 "修复代码并输出**完整、可直接运行的单一 Python 文件**（不是补丁，是全文）。\n"
-                "硬性要求：\n"
-                "1) 保持输出协议：脚本末尾打印两行\n"
+                + (_innov_skill if _innov_skill else
+                   "（技能规范缺失——遵循该领域标准实验约定：单一文件 / 数据划分与标准化按领域惯例 / "
+                   "标准化尺度上算主指标。）")
+                + "\n按「技能执行规范 · innovate」的「实验代码硬性要求」执行，并保持工具输出协议：\n"
+                "1) 末尾打印两行\n"
                 '   BASELINE_JSON={{"mse":..., "mae":...}}\n'
                 '   METRIC_JSON={{"mse":..., "mae":..., "device":..., "epochs":..., "name": "创新点名称"}}\n'
-                "2) 数据管线必须与基线一致：读 CSV，60/20/20 划分，train 统计量标准化，"
-                "滑窗样本，batch=128，Adam lr=0.001，MSE loss；参数从环境变量 EXEC_ARGS 读取"
-                "（格式 |data_dir|seq_len|pred_len|epochs）。\n"
+                "2) 数据管线与基线一致：读数据集文件（时序演示默认：CSV，60/20/20 划分，train 统计量"
+                "标准化，滑窗样本，batch=128，Adam lr=0.001，MSE loss；其他领域按领域惯例调整）；"
+                "参数从环境变量 EXEC_ARGS 读取"
+                "（|data_dir|seq_len|pred_len|epochs）；评估在标准化尺度上算主指标（禁止先反归一化）。\n"
                 "3) 只使用 torch / numpy / pandas；不要引入未安装的库。\n"
                 "4) 已知踩坑经验（避免重犯）：\n"
                 f"{exp_ctx or '（暂无）'}\n"
@@ -1456,7 +1625,7 @@ def make_fix_and_rerun(llm):
             user = (
                 f"创新点（id={innovation_id}）：\n{json.dumps(innov, ensure_ascii=False, indent=1)}\n"
                 f"脚本路径：{code_path}\n"
-                f"数据集：{dataset}（CSV={data_dir}/ETTh1.csv）\n"
+                f"数据集：{dataset}（数据目录={data_dir}，具体文件由脚本按 EXEC_ARGS/领域约定读取）\n"
                 f"配置：seq_len={seq_len}, pred_len={pred_len}, epochs={epochs}\n"
                 f"当前是第 {attempt} 轮修复（上限 {max(1, min(int(max_attempts), 5))} 轮）。\n\n"
                 f"最近一次运行错误日志（尾部）：\n{str(last_log)[-3000:]}"

@@ -7,8 +7,8 @@ LangGraph 节点函数 + AgentState。
     parse ─┬→ simple_chat ───────────────────────────────→ save
            ├→ process_file → file_qa ─┬→ write → judge …
            │                          └→ save
-           └→ agent ⟲ tools   ← 模型选工具（make_outline / search_* / check_coverage /
-                 │               read_papers / ask_user / write_todos），不再调用工具即终止
+           └→ agent ⟲ tools   ← 模型选工具（make_outline / search_* / read_papers /
+                 │               read_sections / write_todos），不再调用工具即终止
                  └→ write → judge → (content_safety) → save     [write_review]
                  └→ answer → (content_safety) → save            [其它]
 工具实现见 agent_tools.py；护栏常量见 config.py。
@@ -16,6 +16,7 @@ LangGraph 节点函数 + AgentState。
 
 import json
 import re
+import threading
 from pathlib import Path
 from typing import TypedDict, Annotated
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
@@ -25,14 +26,17 @@ from langgraph.graph.message import add_messages
 from ResearcherAgent.core.skill_manager import (build_skill_index, validate_skills,
     needs_search_papers, needs_tools,
     needs_index_file, needs_write_review,
-    needs_content_safety, needs_human_review)
+    needs_content_safety, build_skill_instructions)
 from ResearcherAgent.memory.memory_manager import load_all_for_prompt
-from ResearcherAgent.core.config import (MAX_REWRITE_ROUNDS, MAX_RE_RESEARCH, JUDGE_PASS_THRESHOLD,
+from ResearcherAgent.core.config import (MAX_REWRITE_ROUNDS, JUDGE_PASS_THRESHOLD,
     MAX_AGENT_STEPS, TOKEN_BUDGET, KEEP_RECENT_TOOL_MESSAGES,
-    WRITE_SECTION_BUDGET, MAX_REVIEW_CHARS, SECTION_OVERFLOW_TOLERANCE, REVIEW_READ_MAX,
+    WRITE_SECTION_BUDGET, MAX_REVIEW_CHARS, MAX_REVIEW_CHARS_HARD,
+    SECTION_OVERFLOW_TOLERANCE, REVIEW_READ_MAX, LEAD_BLOCK_INPUT_BUDGET,
+    MIN_PAPERS_PER_SECTION,
     _TOOL_FAILURE_PHRASES, _TOOL_FAILURE_HEURISTIC_MAX_LEN,
     _CONTENT_SAFETY_DIMS, _CONTENT_SAFETY_THRESHOLD, _BASE_SAFETY_INSTRUCTION,
-    REJECT_MALICIOUS_THRESHOLD, REJECT_RESEARCHABLE_THRESHOLD, REJECT_RATIO_THRESHOLD)
+    REJECT_MALICIOUS_THRESHOLD, REJECT_RESEARCHABLE_THRESHOLD, REJECT_RATIO_THRESHOLD,
+    FULLTEXT_PARAGRAPH_BUDGET, FIELD_TOP_K)
 from ResearcherAgent.tools.agent_tools import (merge_papers, merge_paper_cards, render_pool, select_tools,
                                      merge_innovations, merge_experiments,
                          build_references, render_section_candidates)
@@ -69,9 +73,9 @@ class AgentState(TypedDict):
     draft_history: list              # 每轮草稿快照 [{"round","draft","revision_plan"}]
     revision_plan: str               # 本轮独立修订说明（write 生成，judge 快照记录）
     judge_issues: list               # claim 级缺陷清单（judge 输出）
-    needs_research: bool             # 证据类缺陷占主导 → 回 agent 重新检索（re_search）
-    re_research_count: int           # 已回研究阶段补检索的次数（独立配额，见 MAX_RE_RESEARCH）
+    needs_research: bool             # 证据类缺陷占比标记（只写入评审报告，不再触发补检索路由）
     evidence_report: dict            # 逐节确定性证据检查明细 {节名: [findings]}（judge 写，write 读）
+    review_report: dict              # 评审报告（总分/维度/引用率/低置信清单，随综述一并交付）
     iteration_log: list              # 每轮 judge 快照（五指标评测）
     discovery_report: dict           # discover_directions 方向发现结果
     memory_ab_delta: str             # 记忆注入前后对照（评测用，可空）
@@ -84,28 +88,22 @@ class AgentState(TypedDict):
     intent_gate: dict               # parse 写入：{"intent","researchable","malicious","reason"}
     rejected: bool                  # 是否已拒答
     reject_reason: str              # 拒答原因（用户可见）
-    # ── 人机审核门（ask_user 工具写入）──
-    human_feedback: str             # JSON: {"action": "accept"|"skip"|"re_search", "feedback": "..."}
-    search_round: int               # 已经过的审核轮次
     # ── 综述研究产物（由工具写入，模型决定顺序）──
     review_outline: list            # 综述大纲 [{"section","focus","queries"}]（make_outline）
     paper_pool: Annotated[list, merge_papers]   # 去重论文池（检索工具入池；上下文只放摘要+句柄）
-    coverage_report: dict           # 每节覆盖度 {"section": {"count","status"}}（check_coverage）
-    gaps: list                      # 缺口章节（check_coverage）
-    selected_papers: list           # 建议精读 [{"title","id","source","section"}]（check_coverage）
     paper_cards: Annotated[list, merge_paper_cards]  # Map 卡片（read_papers，可并行多次追加去重）
     # ── 创新点验证（skill "innovate"）──
     innovations: Annotated[list, merge_innovations]  # propose/novelty 输出（并发合并，按 id 去重）
     experiments: Annotated[dict, merge_experiments]  # implement/judge 记录（并发合并）
     citation_report: dict           # 引用真实性校验结果（judge）
     reference_report: dict          # 参考文献拼装结果 {refs, cited, unmatched, pool}（write）
-    section_candidates: dict        # 每节的重排候选 {_pool_n, sections:{节名:{candidates,...}}}（check_coverage）
+    section_candidates: dict        # 每节的重排候选 {_pool_n, sections:{节名:{candidates,...}}}（read_sections 内嵌重排写回，供证据不足拒答门）
+    json_build_session_id: str      # 流式 MQ 会话 id（read_sections 边制卡边送，write 节点收集）
     todos: list                     # 模型维护的任务清单（write_todos）
     # ── 护栏 ──
     step_count: int                 # agent↔tools 往返次数
     tokens_used: int                # 本次请求累计 token（usage_metadata）
     stop_reason: str                # ""|"model_done"|"max_steps"|"token_budget"|"user_accept"|...
-    _nudged_ask_user: bool          # 是否已提醒过模型"先 ask_user 再收尾"（只提醒一次）
     messages: Annotated[list, add_messages]
 
 
@@ -388,19 +386,13 @@ async def parse_intent_node(state: AgentState, llm):
         "skills": skills,
         "save_path": save_path,
         "rewrite_count": 0,
-        "search_round": 0,
-        "human_feedback": "",
         "step_count": 0,
         "tokens_used": 0,
         "stop_reason": "",
         "tool_failed": False,
-        "_nudged_ask_user": False,
         "historical_knowledge": "",
         "todos": [],
         "review_outline": [],
-        "coverage_report": {},
-        "gaps": [],
-        "selected_papers": [],
         "paper_cards": [],
         "paper_pool": None,          # reducer 收到 None → 清空上一轮的论文池
         "intent_gate": intent_gate,
@@ -783,7 +775,7 @@ def _trim_to_current_turn(messages: list) -> list:
 
     messages 跨轮次累积 + checkpointer 持久化，上一轮的 tool_calls / tool_results 会污染
     当前轮的上下文（换了话题后仍返回上一话题的检索内容）。
-    循环内注入的提示消息（安全反馈、"先 ask_user" 等）不带该 name，不会截断当前轮。
+    循环内注入的提示消息（安全反馈等）不带该 name，不会截断当前轮。
     """
     if not messages:
         return messages
@@ -800,7 +792,7 @@ def _trim_to_current_turn(messages: list) -> list:
 def _mask_old_tool_messages(messages: list, keep_recent: int = KEEP_RECENT_TOOL_MESSAGES) -> list:
     """上下文卸载（视图级，不改 state）：只保留最近 N 条 ToolMessage 原文，更早的替换为一行句柄。
 
-    全量结果已在 paper_pool / paper_cards 里，模型随时可通过 check_coverage / ask_user 视图看到；
+    全量结果已在 paper_pool / paper_cards 里，模型随时可通过 read_papers / read_sections 视图看到；
     这里不做 summary(summary) 式压缩，避免漂移。
     """
     idx = [i for i, m in enumerate(messages) if isinstance(m, ToolMessage)]
@@ -838,28 +830,9 @@ def _agent_system_prompt(state: AgentState, tool_names: list[str], budget_note: 
     if is_review:
         role += [
             "\n## 当前任务：为用户准备一篇文献综述的研究材料（写作由后续环节完成，你不用写正文）",
-            "推荐流程（可按需调整顺序/重复）：write_todos 规划 → make_outline 定 3-6 节大纲 → "
-            "按各节 queries 调用检索工具（同一节可多换关键词；可并行发出多个检索调用）→ "
-            "check_coverage（对**全池**做 Cross-Encoder 重排，给出每节候选与相关性分数）→ "
-            "对候选少的节再检索 → **read_sections**（按节精读，每节自动取 top-2 生成卡片）→ "
-            "ask_user 让用户审核范围（必须）→ 用户接受后停止调用工具。",
-            "精读优先用 read_sections：它按章节分配名额，保证**每一节都有专属素材**；"
-            "只有当你想指定某几篇具体论文时才用 read_papers。",
-            # 只陈述**稳定的事实**（各源覆盖面差异、预算），不写「哪个源稳」——
-            # 「稳不稳」是随时间/网络变化的**运行期信号**，由工具返回文案按实时健康度告诉模型
-            # （源熔断时工具会回「该源已熔断 Ns，请改用：…」）。
-            # ⚠️ 这行曾写「search_arxiv 与 search_crossref 最稳（实测 arxiv 可稳定返回结果）」，
-            #    与实测**完全相反**：4 源实测 arxiv 最慢最不稳（5/6、avg 18.2s、max 70s），
-            #    而 openalex 最快最稳（6/6、avg 1.1s）。写死的"知识"必然过期，别再写回来。
-            "检索工具选择：四个源覆盖面不同，**建议多源搭配**——"
-            "search_openalex 覆盖面广、含摘要比例高；search_crossref 题录最全但多为**题录**、"
-            "带摘要比例低；search_europepmc 适合找有开放获取全文的论文；"
-            "search_arxiv 偏预印本/最新工作。"
-            "写作素材主要来自摘要；某源返回 0 条时换另一个源，不要反复重试同一个"
-            "（若某源已被熔断，工具会直接告诉你该换哪个）。",
-            f"写作侧口径：每节按 {WRITE_SECTION_BUDGET} 字符预算注入论文（约 25 篇带摘要的），"
-            f"排在前面的优先，超出预算的不会进入 prompt。"
-            f"check_coverage 会给出每节**专属带摘要**的篇数，供你判断资料是否够用。",
+            "执行步骤、检索源搭配与精读要求见下方「技能执行规范 · write_review」"
+            "——严格按该技能规范中的流程执行（write_todos 规划 → 演进调研 → 按方向建池 → 大纲 → "
+            "read_sections 精读（每节 top-10，全池确定性重排）→ 停止，交写作环节）。",
             "最终回复：用 3-5 句话总结检索/覆盖情况即可（不要写综述正文）。",
         ]
     else:
@@ -876,18 +849,16 @@ def _agent_system_prompt(state: AgentState, tool_names: list[str], budget_note: 
     if state.get("review_outline"):
         ol = "；".join(f"{o.get('section')}（{', '.join(o.get('queries', [])[:2])}）" for o in state["review_outline"])
         ctx.append("## 当前大纲\n" + ol)
-    if state.get("coverage_report"):
-        # 报「可注入篇数」而非只报总篇数：后者只增不减，会让模型误以为继续检索在进步
-        cov = "，".join(
-            f"{k}:{v.get('status')}（可注入{v.get('injectable', '?')}篇/共{v.get('count')}篇）"
-            for k, v in state["coverage_report"].items())
-        ctx.append("## 当前覆盖度\n" + cov)
     pool_n = len(state.get("paper_pool") or [])
     cards_n = len(state.get("paper_cards") or [])
     if pool_n or cards_n:
         ctx.append(f"## 资料状态\npaper_pool {pool_n} 篇（去重）；paper_cards {cards_n} 张精读卡片。")
     if state.get("historical_knowledge"):
         ctx.append("## 相关历史记忆\n" + state["historical_knowledge"][:1500])
+    # 渐进式披露 L2：选中 skills 的 SKILL.md 正文注入（流程/规则以技能规范为准，不再写死在代码里）
+    _skill_block = build_skill_instructions(skills)
+    if _skill_block:
+        ctx.append(_skill_block)
     ctx.append("## 可用工具\n" + ", ".join(tool_names))
     ctx.append("## 护栏\n" + budget_note)
     return _with_safety("\n".join(role) + "\n\n" + "\n\n".join(ctx), user_request)
@@ -1011,9 +982,9 @@ def make_agent_node(llm, mcp_tools: dict, local_tools: dict):
 def _pool_relevant_ratio_mean(state: AgentState):
     """一轮检索后全池相关比例均值（与 eval_baseline 的 relevant_ratio_mean 同口径）。
 
-    来源：check_coverage 已算好的 section_candidates.sections[*].n_relevant/scored_total
+    来源：read_sections 内嵌全池重排后写回的 section_candidates.sections[*].n_relevant/scored_total
     （Cross-Encoder 全池重排，分数 ≥ RERANK_MIN_SCORE 视为相关）。
-    无重排结果（模型没调 check_coverage）→ None → 不据此拒答（放行）。
+    无重排结果（还没调 read_sections）→ None → 不据此拒答（放行）。
     """
     sect = state.get("section_candidates") or {}
     ratios = []
@@ -1050,7 +1021,7 @@ def reject_node(state: AgentState):
 def route_after_agent(state: AgentState) -> str:
     """模型调用了工具 → tools；否则由模型终止研究阶段 → write / answer。
 
-    唯一的"外层结构"介入：write_review + human_review 且用户还没审核过 → 提醒模型先 ask_user（只提醒一次）。
+    （v1.2.7 已删除人机审核门 nudge——write_review 不再要求 ask_user。）
     """
     messages = state.get("messages", [])
     last = messages[-1] if messages else None
@@ -1058,12 +1029,6 @@ def route_after_agent(state: AgentState) -> str:
         return "tools"
 
     skills = state.get("skills", [])
-    if (needs_human_review(skills) and not state.get("human_feedback")
-            and not state.get("stop_reason") in ("max_steps", "token_budget")
-            and not state.get("_nudged_ask_user")):
-        print("--> [Route] 模型想收尾但用户尚未审核 → 提醒先 ask_user")
-        return "nudge_ask_user"
-
     if needs_write_review(skills):
         # 一轮检索后的确定性拒答门：全池相关比例均值 < 阈值 → 证据不足拒答
         _ratio = _pool_relevant_ratio_mean(state)
@@ -1075,13 +1040,6 @@ def route_after_agent(state: AgentState) -> str:
         return "write"
     print("--> [Route] agent 完成 → answer")
     return "answer"
-
-
-def nudge_ask_user_node(state: AgentState):
-    """外层结构的最小介入：写综述前必须让用户审核一次（人机检查点）。"""
-    return {"_nudged_ask_user": True,
-            "messages": [HumanMessage(content="在进入写作前，请先调用 ask_user 让用户审核当前大纲与资料范围。",
-                                      name="system_nudge")]}
 
 
 _TITLE_STOPWORDS = {
@@ -1135,26 +1093,269 @@ def _ev_cos(v1, v2):
     return sum(a * b for a, b in zip(v1, v2)) / (n1 * n2)
 
 
-def _split_passages(text: str, max_para: int = 900) -> list:
-    """确定性切段：按空行分段，段落首行若为数字节标题（如 3.2 / 4.1）则记录节号。
-    证据直接是**原文段落**（不做 LLM 提炼，杜绝二次有损）。"""
-    t = (text or "")[:30000]
-    out, cur_sec = [], ""
+# ── 节类型词表（五步流水线第 3 步：字段化抽取的确定性定位）──
+# 2026-10 v1.2.2 扩充：尽量用正则/词表命中章节标题，能不用 LLM 就不用。
+# 覆盖通用 + 视觉/医药/时序/工程各领域常见章节命名变体（中英）。
+# 注意子串匹配（kw in H）：桶顺序 background→method→experiment→conclusion，
+# 避免把会被实验桶抢走的词放进前桶（如裸 "SETUP" 会让 "EXPERIMENTAL SETUP" 误归 background）。
+_SECTION_TYPE_KEYWORDS = {
+    "background": (
+        # 通用英文
+        "INTRODUCTION", "INTRO", "BACKGROUND", "MOTIVATION", "PRELIMINARIES",
+        "RELATED WORK", "PROBLEM SETUP", "PROBLEM FORMULATION", "PROBLEM STATEMENT",
+        "TASK DEFINITION", "TASK SETUP", "FORMULATION", "PREREQUISITES",
+        "INTRODUCTION AND BACKGROUND", "BACKGROUND AND RELATED WORK",
+        "BACKGROUND AND MOTIVATION", "PAPER OVERVIEW",
+        # 医学/生物
+        "CLINICAL BACKGROUND", "INTRODUCTION AND OBJECTIVES",
+        "BACKGROUND AND OBJECTIVES", "SIGNIFICANCE", "OBJECTIVE AND AIMS",
+        # 中文
+        "引言", "背景", "绪论", "相关工作", "问题定义", "研究背景",
+        "研究背景与意义", "引言与相关工作", "研究动机", "问题提出", "研究问题",
+    ),
+    "method": (
+        # 通用英文
+        "PROPOSED METHOD", "METHODOLOGY", "METHOD", "APPROACH",
+        "MODEL ARCHITECTURE", "ARCHITECTURE", "PROPOSED MODEL", "FRAMEWORK",
+        "DESIGN", "SYSTEM", "NETWORK", "BACKBONE", "GENERATIVE MODEL",
+        "THE PROPOSED METHOD", "OUR METHOD", "OUR APPROACH", "PROPOSED APPROACH",
+        "PROPOSED FRAMEWORK", "SYSTEM DESIGN", "SYSTEM OVERVIEW", "MODELING",
+        "THE MODEL", "NETWORK DESIGN", "LEARNING ALGORITHM", "ALGORITHM DESIGN",
+        "TRAINING PROCEDURE", "TRAINING DETAILS", "TRAINING", "TECHNICAL APPROACH",
+        # 医学/生物
+        "TRIAL DESIGN", "INTERVENTION", "PROTOCOL",
+        "METHOD AND MATERIALS", "MATERIALS AND METHODS", "STUDY DESIGN",
+        # 中文
+        "方法", "模型", "架构", "提出", "设计", "方法学", "模型结构",
+        "研究方法", "技术路线", "系统设计", "体系结构", "网络结构",
+        "算法设计", "训练细节", "训练过程", "模型设计",
+    ),
+    "experiment": (
+        # 通用英文
+        "EXPERIMENTS", "EXPERIMENTAL SETUP", "RESULTS", "EVALUATION",
+        "EXPERIMENTAL RESULTS", "PERFORMANCE", "BENCHMARKS", "DATASETS",
+        "ABLATION", "QUALITATIVE", "EXPERIMENTS AND RESULTS", "EXPERIMENTAL STUDY",
+        "EMPIRICAL STUDY", "EMPIRICAL EVALUATION", "PERFORMANCE EVALUATION",
+        "BENCHMARK RESULTS", "MAIN RESULTS", "RESULTS AND ANALYSIS",
+        "QUANTITATIVE EVALUATION", "NUMERICAL EXPERIMENTS", "SIMULATION RESULTS",
+        "COMPARATIVE STUDY", "CASE STUDY", "ERROR ANALYSIS", "EVALUATION AND RESULTS",
+        # 医学/生物
+        "COHORT", "OUTCOME", "STATISTICAL ANALYSIS", "CLINICAL OUTCOMES",
+        "OUTCOMES AND ANALYSIS",
+        # 中文
+        "实验", "结果", "评估", "数据集", "性能", "消融", "实验设置",
+        "实验与结果", "实验结果与分析", "实验研究", "实证研究", "性能评估",
+        "对比实验", "仿真实验", "数值实验", "定量评估",
+    ),
+    "conclusion": (
+        # 通用英文
+        "CONCLUSION", "DISCUSSION", "LIMITATIONS", "FUTURE WORK", "SUMMARY",
+        "CONCLUDING REMARKS", "CONCLUSIONS", "DISCUSSION AND CONCLUSION",
+        "CONCLUSION AND DISCUSSION", "DISCUSSION AND FUTURE WORK",
+        "FUTURE DIRECTIONS", "FUTURE PERSPECTIVES", "OUTLOOK",
+        "LIMITATIONS AND FUTURE WORK", "LIMITATION",
+        # 医学/生物
+        "CLINICAL IMPLICATIONS",
+        # 中文
+        "结论", "讨论", "局限", "未来工作", "展望", "总结",
+        "结论与展望", "讨论与结论", "结语", "未来研究方向", "研究结论", "总结与展望",
+    ),
+}
+_FIELD_ORDER = ("background", "method", "experiment", "conclusion")
+# 字段语义 query（与标题拼接后做 embedding 定向打分）
+_FIELD_QUERIES = {
+    "background": "研究背景、动机与问题定义",
+    "method": "提出的方法、模型架构与核心机制",
+    "experiment": "实验设置、数据集与结果指标",
+    "conclusion": "结论、局限与未来工作",
+}
+
+
+def _classify_section_heading(heading: str) -> str:
+    """按多领域变体词表判节类型；顺序=background→method→experiment→conclusion
+    （RESULTS AND DISCUSSION 这种双命中归 experiment，先查后者之前的桶）。"""
+    h = (heading or "").strip().upper()
+    if not h:
+        return "other"
+    for ftype in _FIELD_ORDER:
+        for kw in _SECTION_TYPE_KEYWORDS[ftype]:
+            if kw in h:
+                return ftype
+    return "other"
+
+
+def _split_passages(text: str, max_para: int = 900, full_text: bool = True) -> list:
+    """确定性切段：按空行分段，段落首行若为数字节标题（如 3.2 / 4.1）则记录节号+节标题文字+节类型。
+
+    证据直接是**原文段落**（不做 LLM 提炼，杜绝二次有损）。
+    full_text=True：不再截断前 30000 字符（方案 v1.2：抽取阶段不吃 LLM 上下文，
+    全篇切段后由 _map_to_cards 按字段桶打分，超大文档按段落数预算裁剪）。
+    返回 [{sec, sec_title, sec_type, text}, ...]——sec_title/sec_type 为 2026-10 新增键。
+    """
+    t = text or ""
+    if not full_text:
+        t = t[:30000]
+    # 预扫描数字节号 → 节号兜底类型（无标题关键词时：最小基节→背景，最大基节→结论）
+    # 节头按**首行**判定（标题与正文同段不丢节信息，2026-10 修复）
+    sec_nos = []
     for chunk in re.split(r"\n{2,}", t):
+        lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
+        if not lines:
+            continue
+        m = re.match(r"^(\d+(?:\.\d+)*)[\.\)、]?\s*(.*)$", lines[0])
+        if m and len(m.group(2)) <= 60:
+            sec_nos.append(m.group(1))
+    base_nos = sorted({int(s.split(".")[0]) for s in sec_nos})
+    parent_type: dict = {}
+    if base_nos:
+        for bn in base_nos:
+            if bn == base_nos[0] and bn != base_nos[-1]:
+                parent_type[bn] = "background"
+            elif bn == base_nos[-1] and bn != base_nos[0]:
+                parent_type[bn] = "conclusion"
+            else:
+                parent_type[bn] = "other"
+
+    out, cur_sec, cur_sec_title, cur_sec_type = [], "", "", "other"
+    base_ft: dict = {}   # v1.2.16 基节→类型映射（子节继承父节，消除 4.3 挂实验节下却归 method 类误伤）
+    _BASE_RE = re.compile(r"^(?:Appendix\s+)?([A-Z])(?:\.\d+)?\s", re.I)
+
+    def _base_of(sec: str, title: str) -> str:
+        """节的基节号：数字节号取首段（4.3→4）；字母附录节取字母（C.1→C，Appendix C→C）。"""
+        if sec and re.match(r"^\d+(?:\.\d+)*$", sec):
+            return sec.split(".")[0]
+        m = _BASE_RE.match(title or "")
+        if m:
+            return m.group(1).upper()
+        return ""
+
+    for chunk in re.split(r"\n{2,}", t):
+        lines = [ln.strip() for ln in chunk.splitlines() if ln.strip()]
+        if not lines:
+            continue
         c = " ".join(chunk.split())
-        if not c:
+        is_heading = False
+        # ar5iv/HTML 标题常带 "## " 前缀（"## 4 Experiments"）——先剥掉再按数字节号判定
+        head0 = re.sub(r"^#+\s*", "", lines[0])
+        head_m = re.match(r"^(\d+(?:\.\d+)*)[\.\)、]?\s*(.*)$", head0)
+        if head_m and len(head_m.group(2)) <= 60:
+            cur_sec = head_m.group(1)
+            cur_sec_title = head_m.group(2).strip()
+            is_heading = True
+            if "." in cur_sec:      # 子节（4.3）→ 父节类型优先，词表兜底
+                kt = _classify_section_heading(cur_sec_title)
+                pft = base_ft.get(cur_sec.split(".")[0])
+                if pft and pft != "other":      # 父节已确定（非 other）→ 继承
+                    cur_sec_type = pft
+                else:                           # 父节 other/缺失 → 词表 → 节号兜底
+                    cur_sec_type = kt if kt != "other" else parent_type.get(
+                        int(cur_sec.split(".")[0]), "other")
+            else:                   # 基节（4）→ 词表优先，节号兜底；并更新 base_ft
+                kt = _classify_section_heading(cur_sec_title)
+                cur_sec_type = kt if kt != "other" else parent_type.get(int(cur_sec), "other")
+                base_ft[cur_sec] = cur_sec_type
+        elif _looks_like_heading(head0) and len(lines) > 1:
+            # 无编号标题行（"Introduction" / "EXPERIMENTAL SETUP" 等，词表或全大写短行）
+            # → 同样开启新节，证据锚点用标题本身；v1.2.16：标题行后必须有正文（单行
+            #   作者名/参考文献/页脚不再当标题）。
+            cur_sec = head0[:60]
+            cur_sec_title = head0
+            is_heading = True
+            kt = _classify_section_heading(cur_sec_title)
+            bsec = cur_sec.split(".")[0] if cur_sec.split(".")[0].isdigit() else ""
+            is_sub = "." in cur_sec if bsec else bool(_BASE_RE.match(cur_sec_title or ""))
+            if is_sub and bsec:      # 数字子节（C.1 走标题分支时 bsec 为空，走基节分支）
+                kt2 = _classify_section_heading(cur_sec_title)
+                pft2 = base_ft.get(bsec)
+                cur_sec_type = pft2 if (pft2 and pft2 != "other") else (
+                    kt2 if kt2 != "other" else parent_type.get(int(bsec), "other"))
+            else:
+                base = _base_of(cur_sec, cur_sec_title)
+                if base and base.isalpha():     # 字母附录子节（C.1 / Appendix C）
+                    if re.match(r"^[A-Z]\.\d+", cur_sec_title or ""):
+                        cur_sec_type = base_ft.get(base, kt if kt != "other" else "other")
+                    else:                       # 字母基节（Appendix C）
+                        cur_sec_type = kt if kt != "other" else "other"
+                        base_ft[base] = cur_sec_type
+                else:
+                    cur_sec_type = kt if kt != "other" else parent_type.get(
+                        int(cur_sec.split(".")[0]) if cur_sec.split(".")[0].isdigit() else 0, "other")
+                    if bsec:
+                        base_ft[bsec] = cur_sec_type
+        if not is_heading:
+            while len(c) > max_para:
+                out.append({"sec": cur_sec, "sec_title": cur_sec_title,
+                            "sec_type": cur_sec_type, "text": c[:max_para]})
+                c = c[max_para:]
+            if c:
+                out.append({"sec": cur_sec, "sec_title": cur_sec_title,
+                            "sec_type": cur_sec_type, "text": c})
             continue
-        m = re.match(r"^(\d+(?:\.\d+)*)[\.\)、]?\s*(.*)$", c.strip())
-        if m and len(c) <= 90 and len(m.group(2)) <= 60:
-            cur_sec = m.group(1)
-            out.append({"sec": cur_sec, "text": c[:max_para]})
+        out.append({"sec": cur_sec, "sec_title": cur_sec_title,
+                    "sec_type": cur_sec_type, "text": cur_sec_title[:max_para]})
+        body = " ".join(lines[1:]) if len(lines) > 1 else ""
+        if not body:
             continue
+        c = body
         while len(c) > max_para:
-            out.append({"sec": cur_sec, "text": c[:max_para]})
+            out.append({"sec": cur_sec, "sec_title": cur_sec_title,
+                        "sec_type": cur_sec_type, "text": c[:max_para]})
             c = c[max_para:]
         if c:
-            out.append({"sec": cur_sec, "text": c})
+            out.append({"sec": cur_sec, "sec_title": cur_sec_title,
+                        "sec_type": cur_sec_type, "text": c})
     return out
+
+
+def _noise_heading(line: str) -> bool:
+    """标题行噪音排除（v1.2.16 精确标题策略）：
+    表格行 / 参考文献行 / 无字母词的碎片行 即使在词表命中时也**不当标题**——
+    实测噪音 17/52：| System | Dev | Test |（含 SYSTEM 命中 method）、
+    In Advances in neural information processing systems（含 SYSTEM 命中 method）、
+    ILI 7 7、I 等全被 _looks_like_heading 误判，污染字段桶。"""
+    s = (line or "").strip()
+    if not s:
+        return True
+    if "|" in s:                      # 表格行（Markdown 表格头/分隔行）
+        return True
+    if s.startswith("In "):           # 参考文献行（"In <会议/期刊>..."）
+        return True
+    if " : " in s:                    # 论文标题副标题形态（"BERT : Pre-training of ..."）——
+        return True                   # 词表命中会把它误当 method 节且与字段 query 相似度最高
+    words = [w for w in s.split() if w]
+    if not words or len(words) > 12:
+        return True
+    alpha = [w for w in words if any(ch.isalpha() for ch in w)]
+    if not alpha or sum(len(w) for w in alpha) < 4:   # 纯数字/单字母碎片（"I"）
+        return True
+    if s[-1].isdigit() and _classify_section_heading(s) == "other":
+        return True                   # 以数字结尾且无词表词（"ILI 7 7" 类页脚碎片）
+    return False
+
+
+def _looks_like_heading(line: str) -> bool:
+    """无编号章节标题行的确定性判定：命中节类型词表，或全大写/Title-Case 短行
+    （≤60 字符、不以句号结尾——避免把正文句子误判为节头）。
+    v1.2.16：先过 _noise_heading 噪音排除（表格/参考文献/碎片行不再当标题）。"""
+    s = (line or "").strip()
+    if not s or len(s) > 60:
+        return False
+    if s.endswith((".", "。", "!", "？", ";", "：", ":")):
+        return False
+    if _noise_heading(s):
+        return False
+    if _classify_section_heading(s) != "other":
+        return True
+    words = [w for w in s.split() if w]
+    if not words or len(words) > 12:
+        return False
+    # 全大写短行（INTRODUCTION / EXPERIMENTAL SETUP / A. RESULTS 等）
+    if all(w.isupper() or w.isdigit() or w in ".()&-/:," for w in words):
+        return True
+    # Title-Case 短行：每词首字符大写（含介词），如 "Related Work" / "Proposed Method"
+    if all(w[:1].isupper() for w in words) and len(s) <= 40:
+        return True
+    return False
 
 
 _ARXIV_CODE_URL_CACHE: dict = {}
@@ -1206,16 +1407,149 @@ def _extract_github_url(text: str) -> str:
     return f"https://github.com/{owner}/{repo}"
 
 
-def _map_to_cards(blocks: list, llm) -> list:
-    """【原文段落级证据提取】——对齐成熟科研 agent 的 claim-evidence 做法。
+def _text_table_to_markdown(text: str) -> str:
+    """纯文本表格启发式（PDF 提取等无 HTML 结构时的兜底）：
+    连续 ≥3 行含 '|' 分隔 → 视为 markdown 表格原样保留（行列语义不丢）。"""
+    lines = (text or "").splitlines()
+    out, buf = [], []
+    for ln in lines:
+        s = ln.strip()
+        if s and "|" in s:
+            buf.append(s)
+        else:
+            if len(buf) >= 3:
+                out.append("\n".join(buf))
+            buf = []
+    if len(buf) >= 3:
+        out.append("\n".join(buf))
+    return "\n\n".join(out)
+
+
+def _locate_sections_with_llm(llm, paras: list, title: str) -> dict:
+    """关键词/节号全部失效时的 LLM 兜底定位：返回 {field: sec, ...}。
+    输入=节标题列表+各节首段（不是全文，控 token），一次 LLM 调用。
+    async_pipeline 的 locate_fallback 消费者复用本纯函数。"""
+    heads, seen = [], set()
+    for p in paras:
+        s, t = p.get("sec", ""), p.get("sec_title", "")
+        if not t or s in seen:
+            continue
+        seen.add(s)
+        first = " ".join(p["text"].split())[:200]
+        heads.append(f"{s}: {t} —— {first}")
+    if not heads:
+        return {}
+    prompt = (
+        "你是学术文献结构定位器。下面是一篇论文的章节列表（节号: 标题 —— 首段摘要）。\n"
+        + "\n".join(heads[:40])
+        + "\n\n请把章节归类到四个字段之一：background（背景/引言）、method（方法/模型/机制）、"
+          "experiment（实验/数据集/结果指标）、conclusion（结论/局限/展望）。\n"
+          "注意：不同领域术语不同（如医药 Trial Design/Outcome、视觉 Backbone/Ablation），"
+          "请按语义判断，不要死板匹配；无法归类的返回 null。\n"
+          '只输出 JSON：{"background": "节号或null", "method": "...", '
+          '"experiment": "...", "conclusion": "..."}'
+    )
+    try:
+        resp = llm.invoke(prompt)
+        content = resp.content if hasattr(resp, "content") else str(resp)
+        m = re.search(r"\{.*\}", content, re.S)
+        if not m:
+            return {}
+        d = json.loads(m.group(0))
+        return {k: str(v).strip() for k, v in d.items()
+                if v and str(v).strip().lower() not in ("null", "none", "")}
+    except Exception as e:
+        print(f"    [locate_fallback] LLM 兜底定位失败: {type(e).__name__}: {str(e)[:80]}")
+        return {}
+
+
+_NO_OTHER_FILL = {"abstract", "references", "bibliography",
+                  "acknowledgements", "acknowledgments",
+                  "acknowledgement", "acknowledgment"}
+
+
+def extract_method_json_direct(full_text: str, title: str, section: str,
+                               num, llm) -> dict:
+    """MQ2 兜底（v1.2.17 用户决策）：method 关键词未命中 → LLM 直接提取句式 JSON 块。
+
+    输入=论文全文（截 60000 预算），**一次 LLM 调用**直接输出可直接组装的 method 块
+    （句式四要素「提出了XX / 用XX解决了XX / 数据集+指标」），不做原文卡片再提取
+    （避免两步 LLM）；LLM 判定全文无方法论 → {"drop": true} 丢弃该篇。
+    返回 {"blocks": [...], "drop": bool, "reason": str}。
+    """
+    text = (full_text or "").strip()
+    if len(text) < 300:
+        return {"drop": True, "reason": "全文不可得"}
+    text = text[:60000]
+    n_str = f"[{num}]" if num not in (None, "") else ""
+    prompt = (
+        "你是学术文献方法提取器。下面是论文全文（标题：__TITLE__，所属综述节：__SECTION__，"
+        "引用编号__NUM__）。\n"
+        "__TEXT__\n"
+        "任务：判断这篇论文是否**提出或描述了一个具体的方法/模型/框架/算法**。\n"
+        "1. 如果没有（纯数据集论文、纯综述、立场文、教程，或全文只是在讨论/比较别人的方法而"
+        "未提出自己的方法）→ 输出 {\"drop\": true, \"reason\": \"一句话原因\"}。\n"
+        "2. 如果有 → 用一句话概括该方法，围绕四个核心要素（措辞可灵活，核心必须保留）：\n"
+        "   「XX等人提出了XX，一种XXX，通过XX解决了XXX（难题），在XX数据集上达到XX（指标）。」\n"
+        "   - 提出者/名称/机制/针对难题必须来自全文，不得编造；\n"
+        "   - 数据集+指标必须来自实验部分；**没有实验数据就不写指标句**（论文没给数字就不能编）；\n"
+        "   - 句子末尾标引用编号__NUM__（没给编号就省略）。\n"
+        "   输出 {\"blocks\": [{\"content\": \"一句话...__NUM__\", "
+        "\"evidence\": [\"§节号\"], \"paper_ref\": \"论文标题\"}]}\n"
+        "只输出 JSON，不要其他文字。"
+    )
+    prompt = (prompt.replace("__TITLE__", title or "")
+              .replace("__SECTION__", section or "")
+              .replace("__TEXT__", text)
+              .replace("__NUM__", n_str))
+    try:
+        resp = llm.invoke(prompt)
+        content = resp.content if hasattr(resp, "content") else str(resp)
+        m = re.search(r"\{.*\}", content, re.S)
+        if not m:
+            return {"drop": True, "reason": "LLM 输出非 JSON"}
+        d = json.loads(m.group(0))
+        if d.get("drop") or d.get("dropped"):
+            return {"drop": True, "reason": str(d.get("reason") or "LLM 判定无方法论")}
+        out = []
+        for b in (d.get("blocks") or []):
+            c = str(b.get("content") or "").strip()
+            if not c:
+                continue
+            out.append({
+                "block_type": "method",
+                "content": c,
+                "paper_ref": str(b.get("paper_ref") or "") or title,
+                "evidence": b.get("evidence") or [],
+                "num": num,
+            })
+        if not out:
+            return {"drop": True, "reason": "LLM 未产出方法块"}
+        return {"blocks": out}
+    except Exception as e:
+        print(f"    [mq2_direct] LLM 提取失败 {type(e).__name__}: {str(e)[:80]}")
+        return {"drop": True, "reason": "LLM 提取异常"}
+
+
+def _map_to_cards(blocks: list, llm, skip_llm_fallback: bool = False,
+                  prelocated: dict | None = None) -> list:
+    """【分字段原文证据提取】——五步流水线第 3 步：字段化卡片。
 
     弃用「LLM 提炼卡片」（二次有损压缩是忠实度判不出来的根因之一），改为：
-      1) 读全文（前 30000 字符）；
-      2) 确定性切段，每段带节号（§x.x）；
-      3) embedding（bge-m3）对每段按「章节主题 + 论文标题」定向打分，保留 top-4 原文段落；
-      4) card 字段 = 原文段落拼接（带节号）——写作材料与 judge 判定证据都用它。
+      1) 读全文（全篇，不再 30000 截断；超大文档按 FULLTEXT_PARAGRAPH_BUDGET 兜底保方法/实验节）；
+      2) _split_passages 确定性切段：节号 + 节标题 + 节类型（关键词优先，节号兜底）；
+      3) 按 背景/方法/实验/结论 四字段分桶，桶内 bge-m3 按「字段语义 + 论文标题」打分取 top-2；
+      4) 实验字段内表格转 Markdown（fulltext 层 HTML 表格已转；纯文本启发式兜底）；
+      5) 字段零命中且全文非空 → _locate_sections_with_llm 兜底定位（MQ 消费者复用同一纯函数）。
 
-    blocks: [{"title":..., "id":..., "section":..., "text":...}, ...]
+    v1.2.15（MQ 制卡流水线）：新增两参数——
+      · skip_llm_fallback=True：只走关键词/embedding 确定性路径，缺失字段留空（MQ1 制卡消费者用，
+        命中 extract_mode=keyword 即成功；未命中 → 转 MQ2 由 LLM 兜底）；
+      · prelocated：MQ2 已返回的 {field: sec_no} 定位结果直接注入字段（不再二次调 LLM）。
+
+    card 字段 = 四字段原文拼接（带【字段】标签，写作/评审沿用）；
+    fields 字段 = 结构化字典（JSON 生成/证据锚校验用）；缺失字段标 "none"，禁止编造；
+    extract_mode = keyword | llm_fallback | abstract_only。
     """
     if not blocks:
         return []
@@ -1226,61 +1560,161 @@ def _map_to_cards(blocks: list, llm) -> list:
         title = blk.get("title", "") if isinstance(blk, dict) else ""
         text = blk.get("text", "") if isinstance(blk, dict) else str(blk)
         sec = blk.get("section", "") if isinstance(blk, dict) else ""
-        key = f"{sec}|{title}"
-        cached = cache.llm_get("extract_passages_v3", key, text[:30000])
-        passages = None
+        # v1.2.15 缓存键按制卡路径区分：keyword-only（MQ1 无 LLM 兜底）、prelocated（MQ2）、
+        # 完整（无参数）——防止 MQ1 关键词路径把"残缺卡"写进缓存后，MQ2 LLM 兜底
+        # 重制时命中缓存直接返回残缺卡（LLM 白跑）。旧缓存（无后缀）仍被完整路径命中。
+        mode_sfx = "|kwo" if skip_llm_fallback else (
+            "|pre" if isinstance(prelocated, dict) and any(prelocated.values()) else "")
+        key = f"{sec}|{title}{mode_sfx}"
+        cached = cache.llm_get("extract_passages_v6", key, text[:500])
+        result = None
         if cached:
             try:
-                passages = json.loads(cached)
+                result = json.loads(cached)
                 _n_hit += 1
             except Exception:
-                passages = None
-        if passages is None:
-            paras = _split_passages(text)
+                result = None
+        if result is None:
+            paras = _split_passages(text, full_text=True)
             if not paras:
-                continue
-            q = (sec + " " if sec else "") + title
-            qv = None
-            if ef is not None:
-                _qk = ("#q#", q)
-                if _qk in _ev_query_cache:
-                    qv = _ev_query_cache[_qk]
+                # 全文不可得 → 摘要级兜底卡片（写作只按「未精读·仅摘要」一句话提及）
+                result = {"fields": {f: "none" for f in _FIELD_ORDER},
+                          "card": (" ".join(text.split()))[:4000],
+                          "passages": [], "extract_mode": "abstract_only"}
+            else:
+                # 段落数预算兜底（防 PDF 噪音文本打爆打分）：超预算只保方法/实验节
+                if len(paras) > FULLTEXT_PARAGRAPH_BUDGET:
+                    keep = [p for p in paras if p["sec_type"] in ("method", "experiment")]
+                    bg = [p for p in paras if p["sec_type"] == "background"][:40]
+                    cl = [p for p in paras if p["sec_type"] == "conclusion"][:40]
+                    paras = keep + bg + cl
+                buckets: dict = {}
+                for p in paras:
+                    buckets.setdefault(p.get("sec_type", "other"), []).append(p)
+                fields: dict = {}
+                used_llm = False
+                for ftype in _FIELD_ORDER:
+                    cands = buckets.get(ftype, [])
+                    if not cands:
+                        # v1.2.16 词表未覆盖的标题（如 "An Embarrassingly Simple Baseline"）
+                        # → other 桶节头段落按字段 query 打分补位（bge-m3 确定性，不调 LLM；
+                        #   只对节头段落打分控计算量，选中节则整节内容入字段）。
+                        # 排除框架节（Abstract/References/Acknowledgements 等）：它们的内容
+                        # 是全文浓缩或题录，补进任何字段都会稀释该字段的证据纯度。
+                        other_heads, seen_oh = [], set()
+                        for p in buckets.get("other", []):
+                            st = (p.get("sec_title") or "").strip()
+                            if not st or st.lower() in _NO_OTHER_FILL:
+                                continue
+                            if st not in seen_oh:
+                                seen_oh.add(st)
+                                other_heads.append(p)
+                        cands = other_heads[:FIELD_TOP_K * 3]
+                        if not cands:
+                            continue
+                        from_other = True
+                    else:
+                        from_other = False
+                    q = _FIELD_QUERIES[ftype] + " " + title
+                    qv = None
+                    if ef is not None:
+                        _qk = ("#q#", q)
+                        if _qk in _ev_query_cache:
+                            qv = _ev_query_cache[_qk]
+                        else:
+                            try:
+                                qv = ef(q)
+                                _ev_query_cache[_qk] = qv
+                            except Exception:
+                                qv = None
+                    scored = []
+                    for i, p in enumerate(cands):
+                        s = 0.0
+                        if ef is not None and qv is not None:
+                            _pk = ("#p#", p["text"][:500])
+                            pv = _ev_embed_cache.get(_pk)
+                            if pv is None:
+                                try:
+                                    pv = ef(p["text"][:500])
+                                    _ev_embed_cache[_pk] = pv
+                                except Exception:
+                                    pv = None
+                            s = _ev_cos(pv, qv)
+                        else:
+                            s = 1.0 - i * 1e-6   # 无 embedding 时按原文顺序保序
+                        scored.append((s, p))
+                    scored.sort(key=lambda x: -x[0])
+                    if from_other:
+                        # other 补位：选中节头 top-2 → 整节段落入字段（节头相关=整节相关）
+                        sel_titles = {p.get("sec_title") for _, p in scored[:FIELD_TOP_K]
+                                      if p.get("sec_title")}
+                        full = [p for p in buckets.get("other", [])
+                                if p.get("sec_title") in sel_titles]
+                        fields[ftype] = "\n".join(
+                            f"【§{p['sec'] or '?'}】{p['text']}" for p in full)
+                    else:
+                        fields[ftype] = "\n".join(
+                            f"【§{p['sec'] or '?'}】{p['text']}" for _, p in scored[:FIELD_TOP_K])
+                # 字段零命中 → LLM 兜底定位（只对缺失字段补）
+                # v1.2.15：skip_llm_fallback=True（MQ1 关键词路径）时跳过 LLM；
+                # prelocated（MQ2 已定位结果）直接注入，不再二次调 LLM；
+                # prelocated 非空时不设 len(paras)>3 门槛（短论文 LLM 已定位也照补）。
+                missing = [f for f in _FIELD_ORDER if not fields.get(f)]
+                has_pre = isinstance(prelocated, dict) and any(prelocated.values())
+                if missing and not skip_llm_fallback and (len(paras) > 3 or has_pre):
+                    if has_pre:
+                        located, used_llm = prelocated, True
+                    else:
+                        located = _locate_sections_with_llm(llm, paras, title)
+                        used_llm = True
+                    for ftype in missing:
+                        sec_no = located.get(ftype)
+                        if not sec_no:
+                            continue
+                        picks = [p for p in paras if p["sec"] == sec_no][:FIELD_TOP_K]
+                        if picks:
+                            fields[ftype] = "\n".join(
+                                f"【§{p['sec'] or '?'}】{p['text']}" for p in picks)
+                # 实验字段表格兜底（纯文本启发式，PDF 通路无 HTML 结构）
+                if fields.get("experiment"):
+                    tbl = _text_table_to_markdown(fields["experiment"])
+                    if tbl and tbl not in fields["experiment"]:
+                        fields["experiment"] += "\n\n" + tbl
+                # extract_mode
+                non_none = [f for f in _FIELD_ORDER if fields.get(f)]
+                if not non_none:
+                    mode = "abstract_only"
+                elif used_llm:
+                    mode = "llm_fallback"
                 else:
-                    try:
-                        qv = ef(q)
-                        _ev_query_cache[_qk] = qv
-                    except Exception:
-                        qv = None
-            scored = []
-            for i, p in enumerate(paras):
-                s = 0.0
-                if ef is not None and qv is not None:
-                    _pk = ("#p#", p["text"][:500])
-                    pv = _ev_embed_cache.get(_pk)
-                    if pv is None:
-                        try:
-                            pv = ef(p["text"][:500])
-                            _ev_embed_cache[_pk] = pv
-                        except Exception:
-                            pv = None
-                    s = _ev_cos(pv, qv)
-                else:
-                    s = 1.0 - i * 1e-6   # 无 embedding 时按原文顺序保序
-                scored.append((s, p))
-            scored.sort(key=lambda x: -x[0])
-            passages = [{"sec": p["sec"], "text": p["text"]} for _, p in scored[:4]]
+                    mode = "keyword"
+                fields = {f: (fields.get(f) or "none") for f in _FIELD_ORDER}
+                card_txt = "\n".join(
+                    f"【{ftype}】{fields[ftype]}" for ftype in _FIELD_ORDER if fields[ftype] != "none")
+                # passages 兼容旧消费方（{sec,text} 列表，按字段出现顺序去重）
+                seen_p, passages = set(), []
+                for ftype in _FIELD_ORDER:
+                    for seg in re.split(r"\n(?=【§)", fields[ftype]):
+                        m = re.match(r"【§([^】]+)】", seg)
+                        if m and m.group(1) not in seen_p:
+                            seen_p.add(m.group(1))
+                            passages.append({"sec": m.group(1), "text": seg})
+                result = {"fields": fields, "card": card_txt,
+                          "passages": passages, "extract_mode": mode}
             try:
-                cache.llm_set("extract_passages_v3", key, text[:30000],
-                              json.dumps(passages, ensure_ascii=False))
+                cache.llm_set("extract_passages_v6", key, text[:500],
+                              json.dumps(result, ensure_ascii=False))
             except Exception:
                 pass
-        if passages:
-            card_txt = "\n".join(f"【§{p['sec'] or '?'}】{p['text']}" for p in passages)
+        if result.get("fields"):
             cards.append({"title": title, "id": blk.get("id", "") if isinstance(blk, dict) else "",
-                          "section": sec, "card": card_txt, "passages": passages,
+                          "section": sec, "card": result["card"],
+                          "passages": result.get("passages", []),
+                          "fields": result["fields"],
+                          "extract_mode": result.get("extract_mode", "keyword"),
                           "code_url": _paper_code_url(blk, text)})
     if _n_hit:
-        print(f"    ♻️ [L1] 原文证据段落缓存命中 {_n_hit}/{len(blocks)} 篇")
+        print(f"    ♻️ [L1] 字段化证据段落缓存命中 {_n_hit}/{len(blocks)} 篇")
     return cards
 
 
@@ -1392,42 +1826,53 @@ def _readable_draft(draft: str) -> str:
             + f"\n\n…（正文过长，以上为节选；本文实际共 {n} 字，其余章节因长度限制未展示）")
 
 
+def _norm_title_key(s: str) -> str:
+    """节名/字段匹配用归一化（小写去空白标点）。"""
+    import unicodedata
+    t = unicodedata.normalize("NFKC", s or "").lower()
+    return re.sub(r"[^a-z0-9\u4e00-\u9fff]+", "", t)
+
+
+_POLISH_SECTIONS_PROMPT = """综述「{section}」一节的**已组装句子块**（每个块形如
+「块N [引用编号或(无引用)]：内容」）。请润色成**连贯的学术段落**：
+- 合并重复表达、补充衔接词、调整语序，使其像人写的综述；
+- **不得新增任何事实、数字、方法或论文**；
+- **不得删除、改动、新增引用编号 [N]**（无引用的句子保持无引用）；
+- 只输出润色后的正文段落，不要任何解释、不要标题。
+
+句子块：
+{blocks}"""
+
+
 def section_budgets(n_sections: int, total: int = MAX_REVIEW_CHARS) -> tuple[int, list[int], int]:
-    """把总字数上限分配给「引言 / 各正文节 / 结论」，返回 (引言, [每节], 结论)。
-
-    比例：引言 12%、结论 12%、其余 76% 由正文节均分。
-    宁可每节写短，也不能少节——完整性优先于单节篇幅。
+    """2026-10 v1.2.3 用户硬性字数分配（覆盖原比例分配）：
+      引言 ~300 / 展望 ~300（共 600）；
+      方法节总 2400-3000：方法 3 节 → 每节 900（800-1000 中值）；
+                         方法 4 节 → 每节 700（600-750 中值）；
+      非 3/4 方法节：按 total 剩余均分兜底（每节 ≥250）。
+      n_sections 为大纲总节数（含引言/展望），方法节数 = n_sections - 2
+      （不足 3 时退化为全部当方法节处理）。
     """
-    intro = int(total * 0.12)
-    concl = int(total * 0.12)
-    per = max(400, (total - intro - concl) // max(1, n_sections))
+    intro, concl = 300, 300
+    method_n = max(1, n_sections - 2) if n_sections >= 3 else max(1, n_sections)
+    if method_n == 3:
+        per = 900
+    elif method_n == 4:
+        per = 700
+    else:
+        remaining = max(0, total - intro - concl)
+        per = max(250, remaining // method_n)
+    # b_secs 长度对齐大纲总节数（调用方用 b_secs[i] 按 outline 索引取），per 值按方法节数定
     return intro, [per] * max(1, n_sections), concl
-
-
-def _compress_section(text: str, budget: int, chain) -> str:
-    """把超出预算的一节压缩到 budget 字以内。
-
-    只压超预算的那几节，不整篇重写——成本低，且不会破坏其他已写好的节。
-    """
-    try:
-        resp = chain.invoke({"text": text, "budget": budget})
-        out = resp.content if hasattr(resp, "content") else str(resp)
-        out = (out or "").strip()
-        # 压缩失败（空/反而更长）时保留原文——宁可略超，也不能丢内容
-        if not out or len(out) >= len(text):
-            return text
-        return out
-    except Exception as e:
-        print(f"    ✗ 章节压缩失败，保留原文: {str(e)[:80]}")
-        return text
 
 
 def write_review_node(state: AgentState, llm):
     """【节点 · 撰写综述】根据论文和历史记忆撰写文献综述
 
     如果是重写（rewrite_count > 0），会携带上一轮评委的反馈意见。
-    **总字数受 MAX_REVIEW_CHARS 约束**：分节时按预算下发，超预算的节单独压缩，
-    保证输出是一篇**在预算内完整**的综述，而不是写完再截。
+    **总字数受 MAX_REVIEW_CHARS 约束**：预算在生成/组装端就下发到位——
+    方法节按「引用篇数」挑选、引言/展望按 300 字合成，超预算不压缩不截断，
+    只提示（评审读到全文并被告知实际字数）。
     """
     rewrite_count = state.get("rewrite_count", 0)
     previous_score = state.get("review_score", {})
@@ -1465,14 +1910,9 @@ def write_review_node(state: AgentState, llm):
         )
     else:
         structure_section = (
-            "## 结构要求（优先级：记忆档案偏好 > 此默认结构）\n"
-            "⚠️ 如果上面「你的身份与记忆」或 USER.md 中记录了用户偏好的综述格式/结构，"
-            "请优先使用记忆中的格式，忽略下面的默认结构。\n\n"
-            "若记忆档案中无格式偏好，则使用以下默认结构：\n"
-            "1. **引言**：阐述研究背景、问题定义和综述目的\n"
-            "2. **方法分类与对比**：按方法类型分节，对比各方法的优缺点\n"
-            "3. **研究展望**：指出当前不足和未来方向\n"
-            "4. **参考文献**：列出所有引用文献（作者, 标题, 年份, 来源）"
+            "## 结构要求\n"
+            "按「技能执行规范 · write_review」的「写作阶段规范-综述结构」执行："
+            "用户指定 > 记忆档案偏好 > 默认结构（引言 / 方法分类与对比 / 研究展望 / 参考文献）。"
         )
 
     # 深度阅读素材：Map 出来的结构化卡片（每篇 ≤400 字，不占满上下文）
@@ -1512,29 +1952,44 @@ def write_review_node(state: AgentState, llm):
     # 用户约束：只放**用户原话里确有其事**的那些（parse 节点已做接地核验）
     uc_block = state.get("requirements", "").strip()
 
+    # 渐进式披露 L2：写作规范（结构/规则）来自 write_review/SKILL.md，不再写死在节点里
+    _wskill_block = build_skill_instructions(["write_review"])
+    _wskill_text = f"{_wskill_block}\n\n" if _wskill_block else ""
+
     write_system = _with_safety(
         "⚠️ 上面「你的身份与记忆」中记录了用户的长期偏好（引用格式、语言、结构要求等），"
         "请在写作时严格遵守这些偏好，它们与本次约束具有同等效力。\n\n"
         "你是一个顶级学术研究助手。请撰写一篇专业、逻辑严密的文献综述。\n\n"
-        "## 写作要求\n"
+        + _wskill_text
+        + "## 写作要求\n"
         "- 语言专业但可读性强；客观引用，避免主观断言\n"
         "- **只引用「可引用材料」中明确列出的论文，严禁凭空编造或引用未列出的文献**\n"
-        "- **可引用材料中的论文均带原文证据段落（含节号，可直接支撑论断），严禁引用无证据段落的论文，"
-        "严禁使用证据段落之外的引用编号**\n"
+        "- **材料按证据约束分两级（2026-10 决策，必须区分使用）**：\n"
+        "  · **精读卡论文**（条目带【精读卡片】，卡片=原文证据段落）：可编号引用，可适当扩展描述其方法与实验数据\n"
+        "  · **未精读论文**（条目带【未精读·仅摘要】，仅摘要级信息）：可编号引用，但统一按「XX等人提出了XXX，"
+        "通过XXX（方法）解决XXX」一句话提及；**严禁展开其实验数据、数字结论或细节**，只可用其标题/作者/方法提示里的信息\n"
+        "- **展望与未来挑战章节：只能基于精读卡论文展开**，未精读论文不得作为展望依据\n"
         "- **严禁编造实验数据、结论、作者**；材料里没有的细节不要写\n"
         "- **正文引用直接用材料中给出的编号**（形如 `[12]`），不要自行重新编号、"
         "也不要用作者-年份括注——参考文献表由系统按这些编号自动生成，编号对不上就无法生成\n"
         "- **不要写参考文献列表**（也不要写「参考文献占位说明」）：系统会在全文结束后"
         "自动追加一份基于真实检索记录的参考表\n"
-        f"- ⚠️ **篇幅硬约束**：全文合计不超过 {review_budget} 字（{budget_src}）。为此"
-        f"**宁可每节写短，也绝不能省略任何章节**——完整性优先于篇幅。论断写精炼、"
-        f"删掉套话与重复论述，但必须保留全部必需章节、核心方法与关键结论。\n"
+        f"- ⚠️ **篇幅硬约束**：全文建议 {review_budget} 字（{budget_src}），"
+        f"**最大不超过 {MAX_REVIEW_CHARS_HARD} 字**。论断写精炼、删掉套话与重复论述；"
+        f"有精读卡论文支撑的章节必须完整写出。\n"
+        "- ⚠️ **无素材节拒绝生成（v1.2.18 硬规则）**：若某节【本节卡片】为空、且可引用材料"
+        "中也没有任何该节论文（精读卡片 0 篇），**直接输出「本节因缺乏可精读文献支撑，"
+        "未生成内容」**，**严禁凭自身知识或池内摘要硬写该节**——宁缺毋滥优于无依据编造"
+        "（编造 = 幻觉 + 无锚引用，评审会扣分）。\n"
         "{rewrite_hint}"
     )
 
     def _section_chain(extra_structure: str):
+        # ⚠️ system 消息必须传已构造的 SystemMessage 对象：write_system 经 _with_memory 注入的
+        #    记忆文本可能含裸花括号（历史坑记录/JSON/公式片段），走 f-string 模板解析会报
+        #    "Nested replacement fields are not allowed"（实测 E2E v1.2 崩溃点）。
         return ChatPromptTemplate.from_messages([
-            ("system", write_system),
+            SystemMessage(content=write_system),
             ("user",
              "综述主题: {topic}\n用户约束: {requirements}\n\n"
              "{extra_structure}\n\n"
@@ -1544,6 +1999,279 @@ def write_review_node(state: AgentState, llm):
              "【本次要写的内容】:\n{task}\n\n"
              "额外信息（自行判断是否有用，无用则忽视）:\n{file_section}"),
         ])
+
+    # ════════════════════════════════════════════════════════════════
+    # ★ 五步流水线拼接路径（方案 v1.2 第 5 步）：
+    #   字段化卡片 →（MQ/ThreadPool）句式 JSON 块 → 按节拼接 + 每节衔接润色 → 预算挑选。
+    #   拼接成功则跳过下方逐节 LLM 写作；失败（无块/异常）自动回退现有分节写作。
+    # ════════════════════════════════════════════════════════════════
+    def _match_outline_section(bs: str) -> str:
+        bs = (bs or "").strip()
+        for o in outline:
+            name = (o.get("section") or "").strip()
+            if not name:
+                continue
+            if bs and (bs in name or name in bs or _norm_title_key(bs) == _norm_title_key(name)):
+                return name
+        if not bs or any(k in bs for k in ("引言", "背景")):
+            for o in outline:
+                if "引言" in (o.get("section") or ""):
+                    return o["section"]
+        if any(k in bs for k in ("展望", "结论", "总结", "未来")):
+            for o in outline:
+                if any(k in (o.get("section") or "") for k in ("展望", "结论", "总结", "未来")):
+                    return o["section"]
+        return (outline[0].get("section", "") if outline else "引言")
+
+    def _card_num(c: dict) -> int | None:
+        """卡片 → 池内全局编号（引用编号映射：JSON 用标题 → 组装期统一映射 → [N]）。"""
+        try:
+            from ResearcherAgent.tools.agent_tools import global_index, _norm_card_title, paper_key
+            gidx = global_index(pool)
+            pid = c.get("id", "")
+            for p in pool:
+                if pid and pid in {str(p.get("id", "")), str(p.get("paper_id", "")),
+                                   str(p.get("arxiv_id", "")), str(p.get("pmcid", "") or "")}:
+                    n = gidx.get(paper_key(p))
+                    if n:
+                        return n
+            tn = _norm_card_title(c.get("title", ""))
+            if tn:
+                for p in pool:
+                    if _norm_card_title(p.get("title", "")) == tn:
+                        n = gidx.get(paper_key(p))
+                        if n:
+                            return n
+        except Exception:
+            pass
+        return None
+
+    def _collect_or_submit_json_blocks():
+        """收集 JSON 块：优先 read_sections 流式会话（MQ 增量，卡片边制边送已开跑），
+        补提交不在会话里的其余卡片（read_papers 补充等）；全失败返回 {}。"""
+        from ResearcherAgent.async_pipeline import (
+            collect_json_session, submit_cards_for_json, MqUnavailable)
+        blocks_map: dict = {}
+        done: set = set()
+        sid = state.get("json_build_session_id") or ""
+        if sid:
+            try:
+                blocks_map = collect_json_session(sid) or {}
+                done = set(blocks_map.keys())
+            except MqUnavailable as e:
+                print(f"--> [Write] ⚠️ 流式会话收集失败（{str(e)[:60]}），降级重提交")
+                blocks_map = {}
+            except Exception as e:
+                print(f"--> [Write] ⚠️ 流式会话收集异常（{str(e)[:60]}），降级重提交")
+                blocks_map = {}
+        rest = [c for c in paper_cards if c.get("id") not in done]
+        if rest:
+            try:
+                more = submit_cards_for_json(rest, llm, outline=outline) or {}
+                for k, v in more.items():
+                    blocks_map.setdefault(k, v)
+            except Exception as e:
+                print(f"--> [Write] ⚠️ 补提交 JSON 块异常: {str(e)[:80]}")
+        return blocks_map
+
+    def _sec_for_block(b: dict, c: dict) -> str:
+        """代码确定性归节（v1.2.10：论文按大纲节检索，归属由代码标注，不再要 LLM 选节）：
+        - method 块 → 卡片所属节（该节必为大纲方法节）；不在大纲 → 择优方法节；
+        - intro 块 → 大纲引言节；conclusion 块 → 大纲展望节。"""
+        def _sec_type(name: str) -> str:
+            if any(k in name for k in ("引言", "背景", "introduction", "intro")):
+                return "引言"
+            if any(k in name for k in ("展望", "结论", "总结", "未来", "outlook", "conclusion")):
+                return "展望"
+            return "方法"
+
+        def _pick_method_sec() -> str:
+            for o in outline:
+                if (o.get("type") or _sec_type(o.get("section", ""))) == "方法":
+                    return o.get("section", "")
+            return ""
+
+        bt = str(b.get("block_type") or "").strip().lower()
+        secs = {o.get("section", "") for o in outline}
+        if bt == "method":
+            sec = (c or {}).get("section") or ""
+            if sec in secs:
+                return sec
+            return _pick_method_sec()
+        if bt == "intro":
+            for o in outline:
+                if any(k in o.get("section", "") for k in ("引言", "背景")):
+                    return o.get("section", "")
+            return (outline[0].get("section", "") if outline else "")
+        if bt == "conclusion":
+            for o in outline:
+                if any(k in o.get("section", "") for k in ("展望", "结论", "总结", "未来")):
+                    return o.get("section", "")
+            return ""
+        # block_type 缺失兜底：按卡片主字段推断（method 优先）
+        fields = (c or {}).get("fields") or {}
+        if any(str(fields.get(f) or "").strip() not in ("", "(none)")
+               for f in ("method", "experiment")):
+            sec = (c or {}).get("section") or ""
+            if sec in secs:
+                return sec
+            return _pick_method_sec()
+        for o in outline:
+            if any(k in o.get("section", "") for k in ("展望", "结论", "总结", "未来")):
+                return o.get("section", "")
+        for o in outline:
+            if any(k in o.get("section", "") for k in ("引言", "背景")):
+                return o.get("section", "")
+        return ""
+
+    def _assemble_sections():
+        """返回 (parts, budgets, labels) 或 None（无块→回退现有写作）。"""
+        try:
+            # 优先收集流式会话（read_sections 已边制卡边送 MQ），补提交其余卡片；
+            # outline 不再注入 JSON 生成 prompt（归节已代码化，见 _sec_for_block）。
+            blocks_map = _collect_or_submit_json_blocks()
+        except Exception as e:
+            print(f"--> [Write] ⚠️ JSON 块生成异常，回退逐节写作: {str(e)[:80]}")
+            return None
+        flat = [b for lst in blocks_map.values() for b in lst]
+        if not flat:
+            print("--> [Write] ℹ️ 无句式 JSON 块（卡片为空/生成失败）→ 回退逐节写作")
+            return None
+        print(f"--> [Write] ★ 拼接路径：{len(flat)} 个内容块（{len(blocks_map)} 篇卡片）")
+
+        # 块按大纲节分组（块: (content, num)；归节代码确定性，block_type + 卡片 section）
+        import re as _re
+        by_sec: dict = {}
+        for c in paper_cards:
+            for b in blocks_map.get(c.get("id", ""), []):
+                sec_name = _sec_for_block(b, c)
+                if not sec_name:
+                    continue
+                # v1.2.11 句级锚点：content 已带 LLM 标注的 [N]（制卡分配编号）。
+                # 组装期只做**校验纠正**：块内所有 [N] 纠正为该卡片编号（防串号）；
+                # 无编号的块 → 块尾补 [card.num]（兜底，至少块级锚点）。
+                content = str(b.get("content") or "").strip()
+                cnum = _card_num(c)
+                if cnum:
+                    if _re.search(r"\[\d{1,3}\]", content):
+                        content = _re.sub(r"\[\d{1,3}\]", f"[{cnum}]", content)
+                    else:
+                        content = content.rstrip("。") + f"。[{cnum}]"
+                by_sec.setdefault(sec_name, []).append((content, cnum))
+        if not by_sec:
+            return None
+
+        _polish = ChatPromptTemplate.from_messages([
+            ("system", "你是学术编辑。只做衔接润色：合并重复、补衔接词、调整语序，"
+                       "**不得新增事实/数字/方法/论文，不得改动或新增引用编号 [N]**。"
+                       "直接输出润色后的正文段落，不要任何解释、不要标题。"),
+            ("user", _POLISH_SECTIONS_PROMPT),
+        ]) | llm
+        # 引言/展望节 = 带编号键值对的 **LLM 概括**（v1.2.13）：
+        # 每条素材 = 某篇论文 background/conclusion 字段的忠实转述（句尾带 [N]，
+        # 即「内容↔编号」键值对）。把**内容与引用编号都交给 LLM** 概括组织——
+        # 防错位的关键不是禁止改写，而是强制「编号跟随内容」：A 论文的编号
+        # 不得挂在 B 论文内容的论断上。
+        _synth_lead = ChatPromptTemplate.from_messages([
+            ("system", "你是学术综述的章节概括者。下面是多篇论文提取出的【引言】或【展望】素材块，"
+                       "每条素材句尾的 [N] 是该素材来源论文的引用编号（即「内容↔编号」键值对）。"
+                       "请把它们**概括合成一段连贯的章节正文**：围绕共同主题组织脉络、提炼共性、"
+                       "删除完全重复项、在条与条之间补衔接词（如「此外」「与此同时」）。\n"
+                       "**硬约束（防编号错位）**：\n"
+                       "① 每个论断句尾的 [N] 必须紧跟**真正支撑该论断的那条素材**——"
+                       "A 论文的编号不得挂在 B 论文内容的论断上（这是错位红线，评审会逐句核对）；\n"
+                       "② 概括时可以重组/合并多条素材，但合并后若论断涉及多篇论文，"
+                       "各编号须分别标注在各自论断句尾，不得只保留一个编号；\n"
+                       "③ 不得新增素材之外的论断/事实/论文；不得删除或改写任何素材的 [N]；\n"
+                       "④ 不要给没有素材支撑的概括句硬挂编号。\n"
+                       "直接输出正文段落，不要标题、不要解释。"),
+            ("user", "【章节】{section}（预算 {budget} 字以内）\n【素材块】\n{blocks}"),
+        ]) | llm
+
+        def _is_lead(sec: str) -> bool:
+            return any(k in sec for k in ("引言", "背景", "展望", "结论", "总结", "未来", "挑战"))
+
+        n_secs = len(outline)
+        b_intro, b_secs, b_concl = section_budgets(n_secs, total=review_budget)
+        parts, budgets, labels = [], [], []
+        for o in outline:
+            sec = o.get("section", "")
+            bdgs = b_intro if "引言" in sec else (b_concl if any(
+                k in sec for k in ("展望", "结论", "总结", "未来")) else b_secs[0])
+            items = by_sec.get(sec, [])
+            if not items:
+                continue  # 该节无块：由调用方按混合模式只补写缺节（见下方判定）
+            if _is_lead(sec):
+                # 引言/展望：素材块按输入预算挑选（累计 ≤LEAD_BLOCK_INPUT_BUDGET），
+                # 合并后一次概括合成（输出由 budget=bdgs≈300 字约束）；不是逐块拼接润色
+                picked_in, in_total = [], 0
+                for content, num in items:
+                    if in_total + len(content) > LEAD_BLOCK_INPUT_BUDGET:
+                        break
+                    in_total += len(content)
+                    picked_in.append((content, num))
+                if not picked_in:
+                    continue
+                block_text = "\n".join(
+                    f"素材{i + 1}：{content}" for i, (content, num) in enumerate(picked_in))
+                try:
+                    resp = _synth_lead.invoke({"section": sec, "budget": bdgs, "blocks": block_text})
+                    out = resp.content if hasattr(resp, "content") else str(resp)
+                    out = (out or "").strip()
+                except Exception as e:
+                    print(f"    ✗ {sec} 概括合成失败，用拼接原文: {str(e)[:80]}")
+                    out = "\n\n".join(content for content, _ in items)
+                if not out:
+                    continue
+                parts.append(out)
+                budgets.append(bdgs)
+                labels.append(sec)
+                continue
+            # 方法节：预算挑选（v1.2.3 超预算 = 减少引用篇数，不是压缩/截断）——
+            # 按该节**输出预算** bdgs 累计选择句式片段，放不下的篇目本轮就不引用
+            # （引用编号映射只覆盖被选中的块，未选中篇自然不进正文与参考表）。
+            picked, total = [], 0
+            for content, num in items:
+                if total + len(content) > bdgs:
+                    break
+                total += len(content)
+                picked.append((content, num))
+            if not picked:
+                continue
+            block_text = "\n".join(
+                f"块{i + 1}：{content}" for i, (content, num) in enumerate(picked))
+            try:
+                resp = _polish.invoke({"section": sec, "blocks": block_text})
+                out = resp.content if hasattr(resp, "content") else str(resp)
+                out = (out or "").strip()
+            except Exception as e:
+                print(f"    ✗ {sec} 润色失败，用拼接原文: {str(e)[:80]}")
+                out = "\n".join(content for content, _ in picked)
+            if out:
+                parts.append(out)
+                budgets.append(b_intro if "引言" in sec else (b_concl if any(
+                    k in sec for k in ("展望", "结论", "总结", "未来")) else b_secs[0]))
+                labels.append(sec)
+        if not parts:
+            return None
+        # 混合模式（2026-10 v1.2.1）：**不再全有或全无**——有块的节走拼接组装，
+        # 缺块的节（missing）由调用方只对这些节逐节写作，而不是整体回退逐节写作。
+        covered = set(labels)
+        missing = [o.get("section", "") for o in outline if o.get("section", "") not in covered]
+        if missing:
+            print(f"--> [Write] ℹ️ 拼接覆盖 {len(covered)}/{len(outline)} 节；"
+                  f"缺 {missing} → 仅对这些节逐节写作（其余节用拼接块）")
+        # 证据锚映射：编号 → 该篇被选用块的 evidence 锚点（空列表=无锚，评审标 low_conf）
+        anchor_map: dict = {}
+        for c in paper_cards:
+            num = _card_num(c)
+            if num is None:
+                continue
+            evs = []
+            for b in blocks_map.get(c.get("id", ""), []):
+                evs.extend(b.get("evidence") or [])
+            anchor_map[num] = list(dict.fromkeys(evs))
+        return parts, budgets, labels, anchor_map, missing
 
     # ---- 分节写作（每节独立一次 LLM 调用；每节只注入**该节相关**的卡片，避免长上下文硬塞） ----
     outline = state.get("review_outline", []) or []
@@ -1576,32 +2304,117 @@ def write_review_node(state: AgentState, llm):
         })
         return resp.content if hasattr(resp, "content") else str(resp)
 
-    if outline and len(outline) >= 2:
+    # ★ 优先走拼接路径（混合模式 v1.2.1）：有块的节直接组装；缺块的节只补写缺失节，
+    #   不再"全有或全无"整体回退逐节写作。
+    _assembled = None
+    _anchor_map: dict = {}
+    if paper_cards and outline:
+        _assembled = _assemble_sections()
+
+    # ---- 单节写作（拼接缺块节 / 全量回退 共用）----
+    # v1.2.18：无素材节拒绝生成——方法节必须有该节精读卡片；引言/展望须存在任何
+    # 精读卡片（素材来自卡片的背景/结论字段）。不满足 → 输出占位说明而非硬写
+    # （防 LLM 凭知识编造 → 无引用/幻觉/忠实度受损）。
+    def _section_has_material(sec: str) -> bool:
+        if any(k in sec for k in ("引言", "背景", "展望", "结论", "总结", "未来", "挑战")):
+            return bool(paper_cards)
+        return bool(cards_by_section.get(sec))
+
+    _NO_MATERIAL_PLACEHOLDER = (
+        "（本节未生成：未精读到 ≥{min} 篇可读全文的支撑文献（精读卡片为 0），"
+        "按规则拒绝生成以避免无依据写作。可补充可读全文的论文后重新生成。）").format(
+            min=MIN_PAPERS_PER_SECTION)
+
+    # 大纲自带的引言/展望节用对应预算，其余用正文节预算
+    def _write_section(sec: str, focus: str) -> tuple:
+        if "引言" in sec:
+            budget, task = b_intro, ("请撰写综述的【引言】章节（研究背景、问题定义、综述范围与全文路线图）。聚焦：{focus}。"
+                                     "只引用「可引用材料」和「本节卡片」中的论文，每个论断标注引用。"
+                                     "**本节控制在 {budget} 字以内**。")
+            deep, extra = cards_text[:9000], structure_section
+        elif any(k in sec for k in ("展望", "结论", "总结", "未来")):
+            budget, task = b_concl, ("请撰写综述的【展望与总结】章节（当前不足与未来方向，**只能基于精读卡论文展开**，"
+                                     "未精读论文不得作为展望依据）。聚焦：{focus}。"
+                                     "**本节控制在 {budget} 字以内**。")
+            deep, extra = cards_text[:3000], None
+        else:
+            budget, task = b_secs[idx_of.get(sec, 0)], ("请撰写综述的【{sec}】章节。聚焦：{focus}。"
+                                                        "只引用「可引用材料」和「本节卡片」中的论文，每个论断标注引用。"
+                                                        "**本节控制在 {budget} 字以内**。")
+            deep, extra = _cards_for(sec), None
+        return _gen(task.format(sec=sec, focus=focus, budget=budget)
+                    + (" 若本节没有任何可引用的精读卡片，直接输出「本节因缺乏可精读文献支撑，"
+                       "未生成内容」，不要凭自身知识或池内摘要编造本节内容。"),
+                    deep_section=deep, section=sec, extra_structure=extra or ""), budget
+
+    if _assembled is not None:
+        parts, budgets, labels, _anchor_map, missing = _assembled
+        if missing:
+            # 混合：只对缺块节逐节写作，再按大纲顺序合并
+            idx_of = {o.get("section", ""): i for i, o in enumerate(outline)}
+            n_sec = len(outline)
+            b_intro, b_secs, b_concl = section_budgets(n_sec, total=review_budget)
+            fill = {}
+            for o in outline:
+                sec = o.get("section", "")
+                if sec in missing:
+                    # v1.2.18：无素材节拒绝生成（输出占位说明，不补写硬编）
+                    if not _section_has_material(sec):
+                        print(f"--> [Write] ⛔ {sec} 无精读卡片素材 → 拒绝生成（占位说明）")
+                        fill[sec] = (_NO_MATERIAL_PLACEHOLDER, 0)
+                        continue
+                    t, b = _write_section(sec, o.get("focus", ""))
+                    fill[sec] = (t, b)
+            new_parts, new_budgets, new_labels = [], [], []
+            for o in outline:
+                sec = o.get("section", "")
+                if sec in fill:
+                    new_parts.append(fill[sec][0]); new_budgets.append(fill[sec][1]); new_labels.append(sec)
+                elif sec in labels:
+                    i = labels.index(sec)
+                    new_parts.append(parts[i]); new_budgets.append(budgets[i]); new_labels.append(sec)
+            parts, budgets, labels = new_parts, new_budgets, new_labels
+            print(f"--> [Write] 混合拼接完成：{len(labels)} 节（拼接 {len(labels) - len(missing)} + 补写 {len(missing)}）")
+    elif outline and len(outline) >= 2:
+        # 全部回退逐节写作（无任何拼接块）
         # 字数预算按节下发：超预算的节写完再单独压缩，而不是整篇截断
+        names = [o.get("section", "") for o in outline]
+        has_intro = any("引言" in n for n in names)
+        has_outlook = any(any(k in n for k in ("展望", "结论", "总结", "未来")) for n in names)
         n_sec = len(outline)
         b_intro, b_secs, b_concl = section_budgets(n_sec, total=review_budget)
+        idx_of = {o.get("section", ""): i for i, o in enumerate(outline)}
         print(f"--> [Write] 分节写作 {n_sec} 节（总预算 {review_budget} 字，{budget_src}："
-              f"引言 {b_intro} + 每节 {b_secs[0]} + 结论 {b_concl}）...")
-        budgets = []
-        parts = [_gen(
-            f"请为整篇综述写一段**引言**（研究背景、问题定义、综述目的）与一段**摘要**。"
-            f"**本节控制在 {b_intro} 字以内**。不要写参考文献列表。",
-            deep_section=cards_text[:9000], extra_structure=structure_section)]
-        budgets.append(b_intro)
+              f"引言 {b_intro} + 每节 {b_secs[0]} + 结论 {b_concl}"
+              f"{'' if has_intro else '；大纲未含引言，自动补引言'}") 
+        budgets, parts, labels = [], [], []
+        if not has_intro:
+            parts.append(_gen(
+                f"请为整篇综述写一段**引言**（研究背景、问题定义、综述目的）与一段**摘要**。"
+                f"**本节控制在 {b_intro} 字以内**。不要写参考文献列表。",
+                deep_section=cards_text[:9000], extra_structure=structure_section))
+            budgets.append(b_intro)
+            labels.append("引言")
         for i, o in enumerate(outline):
             sec = o.get("section", "")
             focus = o.get("focus", "")
+            # v1.2.18：无素材节拒绝生成（占位说明，不补写硬编）
+            if not _section_has_material(sec):
+                print(f"--> [Write] ⛔ {sec} 无精读卡片素材 → 拒绝生成（占位说明）")
+                parts.append(_NO_MATERIAL_PLACEHOLDER)
+                budgets.append(0)
+                labels.append(sec)
+                continue
+            t, b = _write_section(sec, focus)
+            parts.append(t)
+            budgets.append(b)
+            labels.append(sec)
+        if not has_outlook:
             parts.append(_gen(
-                f"请撰写综述的【{sec}】章节。聚焦：{focus}。"
-                f"只引用「可引用材料」和「本节卡片」中的论文，每个论断标注引用。"
-                f"**本节控制在 {b_secs[i]} 字以内**。",
-                deep_section=_cards_for(sec), section=sec))
-            budgets.append(b_secs[i])
-        parts.append(_gen(
-            f"请写一段简短的**结论与展望**。**本节控制在 {b_concl} 字以内**。",
-            deep_section=cards_text[:3000]))
-        budgets.append(b_concl)
-        labels = ["引言"] + [o.get("section", "") for o in outline] + ["结论与展望"]
+                f"请写一段简短的**结论与展望**。**本节控制在 {b_concl} 字以内**。",
+                deep_section=cards_text[:3000]))
+            budgets.append(b_concl)
+            labels.append("结论与展望")
     else:
         # 无大纲（或只有 1 节）：一次成文，同样受总字数约束
         print(f"--> [Write] 整篇写作（总预算 {review_budget} 字，{budget_src}）...")
@@ -1613,27 +2426,39 @@ def write_review_node(state: AgentState, llm):
             f"不要写参考文献列表。",
             deep_section=cards_text[:8000], extra_structure=structure_section)]
 
-    # ---- 超预算压缩：只压超标的节，不整篇重写 ----
+    # ---- 超预算处理（v1.2.3 用户硬性规定：不压缩、不截断）----
+    # 组装路径：方法节已在预算挑选阶段按「引用篇数」控制（放不下的片段不引用），
+    # 引言/展望由合成输出预算（300 字）约束——正常不会超。
+    # 回退/补写路径（LLM 自由写作）若仍超节预算：保持原文，只提示，评审读到全文并被告知实际字数。
     over = [i for i, p in enumerate(parts)
             if budgets[i] and len(p) > budgets[i] * SECTION_OVERFLOW_TOLERANCE]
     if over:
-        compress_chain = ChatPromptTemplate.from_messages([
-            ("system", "你是学术编辑。把给定的章节压缩到字数上限以内。"
-                       "**必须保留全部小节结构、所有引用标记与核心结论**，"
-                       "只删套话、重复论述和冗余修饰。直接输出压缩后的正文，不要任何说明。"),
-            ("user", "字数上限：{budget} 字。\n\n原文：\n{text}"),
-        ]) | llm
-        print(f"--> [Write] {len(over)} 节超预算 → 压缩: "
+        print(f"--> [Write] ⚠️ {len(over)} 节超预算（不压缩/不截断，保持原文，评审被告知实际字数）: "
               f"{[(labels[i], len(parts[i]), budgets[i]) for i in over]}")
-        for i in over:
-            parts[i] = _compress_section(parts[i], budgets[i], compress_chain)
 
-    draft = "\n\n".join(p for p in parts if p)
+    # v1.2.9：按大纲节拼稿时给每节加 `## 节标题`（labels 与 parts 按大纲顺序一一对应）——
+    # ① 提升综述可读性；② judge 按一级 ## 切分才能真正按节并行评审（此前纯段落只切出 1 节，
+    #    局部评审退化为一次调用且只覆盖前 2800 字）。
+    if labels and len(labels) == len(parts):
+        _seg = []
+        for _p, _lb in zip(parts, labels):
+            if not _p or not _p.strip():
+                continue
+            _seg.append(f"## {_lb}\n\n{_p.strip()}")
+        draft = "\n\n".join(_seg)
+    else:
+        draft = "\n\n".join(p for p in parts if p)
     if len(draft) > review_budget:
-        print(f"--> [Write] ⚠️ 压缩后仍 {len(draft)} 字（预算 {review_budget}）——"
-              f"不再截断（截断会破坏完整性），评审会读到全文并被告知实际字数")
+        # 超建议预算（3000）：只提示，不截断/不压缩，评审读到全文并被告知实际字数
+        print(f"--> [Write] ⚠️ 正文 {len(draft)} 字（预算 {review_budget}）——"
+              f"不压缩/不截断，评审会读到全文并被告知实际字数")
     else:
         print(f"--> [Write] ✅ 正文 {len(draft)} 字 / 预算 {review_budget} 字")
+    # 硬上限（4000，用户"最大允许"）：仍超则只提示（用户字数分配 3节≈3300/4节≈3400，
+    # 正常不会触发）；评审读到全文并被告知实际字数，交用户裁量。
+    if len(draft) > MAX_REVIEW_CHARS_HARD:
+        print(f"--> [Write] 🚫 超硬上限 {MAX_REVIEW_CHARS_HARD} 字 → 保持全文 {len(draft)} 字"
+              f"（不压缩/不截断），评审与用户被告知实际字数")
 
     # ---- 参考文献：代码强制追加，用池内真实元数据拼装（不靠 LLM，结构上不可能编造） ----
     # 引用体例：用户点名了就用用户的（已有接地核验），否则按中文学术惯例用 GB/T 7714
@@ -1669,7 +2494,8 @@ def write_review_node(state: AgentState, llm):
             print(f"--> [Write] ⚠️ 修订说明生成失败: {str(e)[:80]}")
 
     return {"draft_review": draft, "reference_report": ref_report,
-            "revision_plan": revision_plan}
+            "revision_plan": revision_plan,
+            "review_block_anchors": _anchor_map}
 
 
 def judge_review_node(state: AgentState, judge_llm):
@@ -1686,27 +2512,22 @@ def judge_review_node(state: AgentState, judge_llm):
     """
     print("--> [Judge] 分节评审（局部×N 并行 + 全局×1 + 确定性证据信号）...")
     draft = state.get("draft_review", "")
-    # ── 写后确定性约束：正文 [N] 必须属于「有原文段落证据」的论文（证据闭环最后一步）──
+    # ── 写后确定性约束：正文 [N] 必须属于「池内真实论文」；池外编号=幻觉引用，删除。
+    # 2026-10 语义修正：池内未精读论文（仅摘要级）是**正常综述引用**（弱证据），
+    # 不再移除——由确定性证据检查标记为 weak_evidence 进低置信清单交用户审核；
+    # 只有引用池外不存在的编号（幻觉）才确定性删除。
     try:
-        from ResearcherAgent.tools.agent_tools import global_index, paper_key, _norm_card_title
+        from ResearcherAgent.tools.agent_tools import global_index, paper_key
         from ResearcherAgent.core.evidence_check import enforce_citation_domain
         _pool = state.get("paper_pool") or []
-        _cards = state.get("paper_cards") or []
         _gidx = global_index(_pool)
-        _rev = {}
-        for _p in (_pool or []):
-            _i = _gidx.get(paper_key(_p))
-            if _i:
-                _rev[_i] = _p
-        _norm2num = {_norm_card_title(_p.get("title", "")): _i for _i, _p in _rev.items()}
-        _ev_nums = {_norm2num[_norm_card_title(_c.get("title", ""))]
-                    for _c in (_cards or [])
-                    if _c.get("card") and _norm_card_title(_c.get("title", "")) in _norm2num}
-        if _ev_nums:
-            draft, _removed = enforce_citation_domain(draft, _ev_nums)
+        _pool_nums = {_gidx.get(paper_key(p)) for p in (_pool or []) if isinstance(p, dict)}
+        _pool_nums.discard(None)
+        if _pool_nums:
+            draft, _removed = enforce_citation_domain(draft, _pool_nums)
             if _removed:
-                print(f"--> [Judge] ✂️ 确定性引用约束：移除正文 {len(_removed)} 个非证据编号 {_removed}"
-                      f"（写作只允许引有原文证据的论文）")
+                print(f"--> [Judge] ✂️ 确定性引用约束：移除正文 {len(_removed)} 个**池外幻觉**编号 {_removed}"
+                      f"（池内未精读引用保留，作为摘要级弱证据标记）")
     except Exception as _ex:
         print(f"--> [Judge] ⚠️ 引用约束 enforce 失败（跳过）: {str(_ex)[:80]}")
     topic = state["topic"]
@@ -1783,33 +2604,40 @@ def judge_review_node(state: AgentState, judge_llm):
     if _embed_fn is not None:
         from ResearcherAgent.core.evidence_check import build_ref_sample
         _ref = build_ref_sample(cite_map)      # 对比参照（非被引论文），用于边距判定
+        _card_nums = {n for n, _p in cite_map.items() if _p.get("card")}  # 精读卡论文编号集
         for _s in _sections:
             _f = check_section_deterministic(_s["text"], cite_map, _embed_fn, _cos_cache,
-                                             ref_sample=_ref)
+                                             ref_sample=_ref, card_nums=_card_nums)
             det_raw[_s["title"]] = _f
             det_reports[_s["title"]] = summarize_findings(_f)
         _n_flag = sum(1 for r in det_reports.values() if r)
         _n_hard = sum(1 for v in det_raw.values() for f in v
                       if str(f.get("verdict", "")).startswith("no_anchor")
                       or f.get("verdict") == "no_citation")
+        _n_weak = sum(1 for v in det_raw.values() for f in v
+                      if f.get("verdict") == "weak_evidence")
         print(f"--> [Judge] 确定性证据检查:{_n_flag}/{len(_sections)} 节有问题"
-              f"（其中确定性问题 {_n_hard} 处：无锚引用/有事实无出处）")
+              f"（确定性问题 {_n_hard} 处：无锚/无出处；摘要级弱证据 {_n_weak} 处标记待用户审核）")
 
     # ── 局部评审（每节一次，并行）──
+    # 渐进式披露 L2：评审维度/确定性证据档位来自 judge_review/SKILL.md，不再写死在节点里
+    # ⚠️ 必须转义花括号：正文含 JSON 输出契约 {type,claim,...}，拼进 ChatPromptTemplate
+    #    会被 langchain f-string formatter 解析成非法格式说明符（Invalid format specifier）。
+    #    转义后模板原样渲染回 {}，LLM 看到的文本不变。
+    _judge_skill = build_skill_instructions(["judge_review"]).replace("{", "{{").replace("}", "}}")
+
     LOCAL_SYS = _with_memory(
         "⚠️ 上面「你的身份与记忆」中的用户长期偏好与当前约束同等效力。\n\n"
         "你是严格的学术期刊审稿人。现在只评审综述的**一个章节**，从严打分（宁严勿宽，"
-        "证据不足必须扣分，不许宽容放水）。对以下 4 个维度打分（各 1-10 分）：\n"
-        "1. 内容深度——本节是否深入对比了不同方法的原理与优缺点\n"
-        "2. 逻辑严谨性——本节论证是否清晰有层次、不自相矛盾\n"
-        "3. 证据忠实度——本节每个论断引用的 [N] 是否真的被「该节引用论文」支持；"
-        "论断核心事实（方法/机制/结论/数字/年份）与引用论文明显不符、夸大、无中生有都必须扣分。"
-        "下方「确定性证据检查」分两档，**别把两档同等对待**："
-        "【确定性问题】（引用了池中不存在的编号 / 陈述事实却无任何引用 / "
-        "NLI 判定论断与引用论文**矛盾**）必须据此扣分并列入 issues；"
-        "【辅助提示 weak_match】仅相似度边距偏低，通用背景句常会误报，"
-        "**须你判断后再决定是否扣分**。\n"
-        "4. 覆盖度——本节是否覆盖了应有的子方向（有缺失报 coverage_gap）。\n\n"
+        "证据不足必须扣分，不许宽容放水）。\n\n"
+        + (_judge_skill or "")
+        + "\n按上述技能规范执行：局部评审 4 维（内容深度/逻辑严谨性/证据忠实度/覆盖度）各 1-10 分；"
+        "确定性证据检查分两档，按规范区分对待（确定性问题必须扣分，weak_match 由你判断）。\n\n"
+        "**引用锚点口径（v1.2.13 硬约束，评审时不得违背）**：一个以句号（。！？）结尾的完整"
+        "论断句，句尾出现 [N] 即视为**已锚定**——它是对编号 N 论文的整句引用（内部可用逗号/"
+        "分号连接多个小句，如「XX提出了XX，解决了XX，指标XX[12]。」）。"
+        "**同一句内以逗号/分号分隔的子句不要求各自标注 [N]**，不得据此报 no_anchor/no_citation；"
+        "只有**整个句号句完全没有 [N]** 且该句像需要出处的事实陈述时，才报 no_citation。\n\n"
         '只输出 JSON：{{"内容深度": <int>, "逻辑严谨性": <int>, "证据忠实度": <int>, '
         '"coverage_ok": <bool>, '
         '"issues": [{{"type": "citation_mismatch|no_anchor|evidence_insufficient|'
@@ -1866,13 +2694,10 @@ def judge_review_node(state: AgentState, judge_llm):
     GLOBAL_SYS = _with_memory(
         "⚠️ 上面「你的身份与记忆」中的用户长期偏好与当前约束同等效力。\n\n"
         "你是严格的学术期刊审稿人。现在评审整篇综述的**全局层面**（不逐句核对内容，"
-        "内容层面的证据忠实度由逐节评审负责），从严打分（宁严勿宽）。对以下 5 个维度打分（各 1-10 分）：\n"
-        "1. 结构完整性——引言/各节/结论/参考文献是否齐全，节序合理\n"
-        "2. 学术规范性——章节格式统一、术语准确、引用编号连续可查（编号断档/格式混用扣分）\n"
-        "3. 即时约束遵守度——是否严格遵守用户本次明确提出的约束（无额外约束则给满分）\n"
-        "4. 记忆偏好遵守度——是否遵守记忆档案中的长期偏好（空则给满分）\n"
-        "5. 篇幅遵守度——正文长度 vs 预算：≤预算 10 分；预算<长度≤1.25×预算 9 分；"
-        "1.25×~1.5× 3-6 分；>1.5× 1-3 分。\n\n"
+        "内容层面的证据忠实度由逐节评审负责），从严打分（宁严勿宽）。\n\n"
+        + (_judge_skill or "")
+        + "\n按上述技能规范执行：全局评审 5 维（结构完整性/学术规范性/即时约束遵守度/"
+        "记忆偏好遵守度/篇幅遵守度）各 1-10 分。\n\n"
         '只输出 JSON：{{"结构完整性": <int>, "学术规范性": <int>, '
         '"即时约束遵守度": <int>, "记忆偏好遵守度": <int>, "篇幅遵守度": <int>, '
         '"issues": [{{"type": "citation_mismatch|no_anchor|coverage_gap|style|logic_gap", '
@@ -1991,12 +2816,13 @@ def judge_review_node(state: AgentState, judge_llm):
     print(f"--> [Judge] 评分: {total}/10 | {'✅ 通过' if passed else '❌ 需重写'} | "
           f"引用真实率={cite['rate']} | 各维度: {agg} | issues {len(issues)} 条: {dist_now}")
 
-    # ── 证据类缺陷主导 → re_search ──
+    # ── 证据类缺陷占比（只写入评审报告/低置信清单；单次评审不补检不重写）──
     n_evid = sum(1 for i in issues
                  if i["type"] in ("evidence_insufficient", "no_anchor", "faithfulness"))
     needs_research = bool(issues and n_evid >= max(2, int(len(issues) * 0.5)))
     if needs_research:
-        print(f"--> [Judge] ⚠️ 证据类缺陷 {n_evid}/{len(issues)} 占主导 → 需要重新检索（re_search）")
+        print(f"--> [Judge] ⚠️ 证据类缺陷 {n_evid}/{len(issues)} 占主导 → 计入评审报告"
+              f"（单次评审：不补检索、不重写，低置信点交用户审核）")
 
     # ── 迭代快照 ──
     round_no = state.get("rewrite_count", 0) + 1
@@ -2020,10 +2846,87 @@ def judge_review_node(state: AgentState, judge_llm):
                   "citation_rate": cite.get("rate")}
     for _d in dims:
         score_data[_d] = agg.get(_d)
+    # ── 低置信内容清单（评审报告核心：确定性证据逐句 verdict + 证据类 issues）──
+    # 口径与 summarize_findings 一致：no_anchor*/no_citation/nli_contradiction 为确定性问题，
+    # weak_match/no_evidence_text/weak_evidence 为辅助提示（weak_evidence=摘要级引用，2026-10）；
+    # nli_neutral 不算缺陷（跨语言下偏高、非缺陷）。
+    LOW_CONF_ISSUE = ("no_anchor", "no_citation", "nli_contradiction",
+                      "weak_match", "no_evidence_text", "weak_evidence")
+    _REASON = {
+        "no_anchor": "引用了论文池中不存在的编号（无锚引用）",
+        "no_citation": "陈述事实但没有引用任何论文",
+        "nli_contradiction": "论断与所引论文内容矛盾（NLI 判定）",
+        "weak_match": "论断与所引论文相似度偏低（可能张冠李戴，弱信号）",
+        "no_evidence_text": "所引论文缺少可核对的证据文本（无摘要/无卡片）",
+        "weak_evidence": "所引论文仅摘要级信息（未精读原文），论断细节未经原文核对",
+    }
+    low_conf = []
+    for _sec, _finds in (det_raw or {}).items():
+        for _f in _finds or []:
+            _v = str(_f.get("verdict", ""))
+            if not (_v.startswith("no_anchor") or _v in LOW_CONF_ISSUE):
+                continue
+            _key = "no_anchor" if _v.startswith("no_anchor") else _v
+            low_conf.append({
+                "section": _sec,
+                "sentence": str(_f.get("sentence", ""))[:200],
+                "issue": _v,
+                "reason": _REASON.get(_key, _v),
+                "anchors": _f.get("anchors") or [],
+                "sim": _f.get("sim"),
+                "margin": _f.get("margin"),
+            })
+    # ── 五步流水线证据锚校验（方案 v1.2 5.5）──
+    # 拼接路径下，write 节点把「编号 → 该篇被选用块的 evidence 锚点」写入
+    # state.review_block_anchors（空列表 = 块无证据锚）。评审对引用了这些编号的句子，
+    # 若其卡片块无证据锚 → 追加 weak_evidence 低置信条目（细节未经原文核对）。
+    _block_anchors = state.get("review_block_anchors") or {}
+    if _block_anchors:
+        _seen_keys = {(x["section"], x["sentence"]) for x in low_conf}
+        for _sec, _finds in (det_raw or {}).items():
+            for _f in _finds or []:
+                _key = (_sec, str(_f.get("sentence", ""))[:200])
+                if _key in _seen_keys:
+                    continue
+                _no_anchor_hit = False
+                for _a in (_f.get("anchors") or []):
+                    _as = str(_a).strip("[]")
+                    if _as.isdigit() and int(_as) in _block_anchors \
+                            and not _block_anchors[int(_as)]:
+                        _no_anchor_hit = True
+                        break
+                if _no_anchor_hit:
+                    low_conf.append({
+                        "section": _sec,
+                        "sentence": str(_f.get("sentence", ""))[:200],
+                        "issue": "weak_evidence",
+                        "reason": "句式块无证据锚（卡片字段缺失/仅摘要），细节未经原文核对（流水线锚点校验）",
+                        "anchors": _f.get("anchors") or [],
+                    })
+                    _seen_keys.add(_key)
+    low_conf = low_conf[:20]
+    if low_conf:
+        print(f"--> [Judge] 📋 低置信内容清单 {len(low_conf)} 条"
+              f"（随评审报告交付，交用户审核）")
+
+    review_report = {
+        "total_score": total,
+        "passed": passed,
+        "threshold": JUDGE_PASS_THRESHOLD,
+        "dimensions": agg,
+        "citation_rate": cite.get("rate"),
+        "needs_research": needs_research,
+        "issues": issues,
+        "low_confidence": low_conf,
+        "generated_at": time.strftime("%Y-%m-%d %H:%M:%S"),
+    }
+
     updates = {"review_score": score_data, "citation_report": cite,
                # enforce 后的稿子回写（非证据编号已从正文/参考表移除）
                "draft_review": draft,
                "judge_issues": issues, "needs_research": needs_research,
+               # 评审报告：随综述一并交付（含低置信内容清单，交用户审核）
+               "review_report": review_report,
                # 逐句确定性证据明细 → 供 write 重写时定位「哪句/引了哪篇/余弦多少」
                "evidence_report": det_raw,
                "iteration_log": iter_log}
@@ -2037,6 +2940,77 @@ def judge_review_node(state: AgentState, judge_llm):
     return updates
 
 
+def _judge_report_md(updates: dict, state: dict) -> str:
+    """后台评审返回 updates → 人类可读评审报告 md（总分/各维/引用率/issues/低置信清单）。"""
+    report = updates.get("review_report") or {}
+    dims = report.get("dimensions") or {}
+    issues = report.get("issues") or []
+    low = report.get("low_confidence") or []
+    lines = [
+        "# 综述评审报告（后台异步生成）",
+        "",
+        f"- 生成时间：{report.get('generated_at', '')}",
+        f"- 总分：**{report.get('total_score')}/10**（阈值 {report.get('threshold')}）"
+        + (" ✅ 通过" if report.get("passed") else " ❌ 未通过（单次评审不重写，低置信点交用户审核）"),
+        f"- 引用真实率：{report.get('citation_rate')}",
+        "",
+        "## 各维度得分",
+    ]
+    for k, v in dims.items():
+        lines.append(f"- {k}：{v}")
+    lines += ["", "## 缺陷 issues"]
+    for i in issues:
+        lines.append(f"- [{i.get('type')}] {str(i.get('claim', ''))[:120]}｜{str(i.get('problem', ''))[:150]}")
+    if not issues:
+        lines.append("- 无")
+    lines += ["", "## 低置信内容清单（交用户审核）"]
+    if low:
+        for x in low:
+            lines.append(f"- 【{x.get('section')}】{str(x.get('sentence', ''))[:160]}｜"
+                         f"问题：{x.get('issue')}｜原因：{str(x.get('reason', ''))[:120]}")
+    else:
+        lines.append("- 无")
+    return "\n".join(lines)
+
+
+def async_judge_node(state: AgentState, judge_llm):
+    """【节点 · 评委打分 v3 异步化】综述先行交付，评审报告后台生成。
+
+    用户决策（2026-10）：judge 同步评审曾占总耗时 58.8%（250s+），综述交付前
+    用户只能干等 → 本节点只**启动 daemon 线程**执行完整评审（judge_review_node
+    主体：局部×N 并行 + 全局 + 确定性证据 + 低置信清单），**立即返回**；
+    评审报告写入 logs/review_report_latest.md/.json，完成后向用户补交。
+    线程持有 state 快照（dict），不引用图 state；embedding 复用模块级单例。
+    """
+    _snap = dict(state)
+    print("--> [Judge] 🚀 评审已异步化：综述先行交付，评审报告后台生成中（约数分钟）...")
+
+    def _run():
+        try:
+            updates = judge_review_node(_snap, judge_llm)
+        except Exception as e:
+            print(f"--> [Judge] ❌ 后台评审失败: {str(e)[:200]}")
+            updates = {}
+        try:
+            from ResearcherAgent.core.paths import REPO_ROOT
+            import json as _json
+            _md = _judge_report_md(updates, _snap)
+            _rep = updates.get("review_report") or {}
+            _p = REPO_ROOT / "logs" / "review_report_latest.md"
+            _p.parent.mkdir(parents=True, exist_ok=True)
+            _p.write_text(_md, encoding="utf-8")
+            _pj = REPO_ROOT / "logs" / "review_report_latest.json"
+            _pj.write_text(_json.dumps(_rep, ensure_ascii=False, indent=2), encoding="utf-8")
+            print(f"--> [Judge] ✅ 后台评审完成 → {_p}")
+        except Exception as e:
+            print(f"--> [Judge] ⚠️ 报告落盘失败: {str(e)[:120]}")
+
+    threading.Thread(target=_run, daemon=True, name="judge_async").start()
+    return {"judge_async_dispatched": True,
+            "review_score": {"status": "pending", "passed": True,
+                             "feedback": "评审后台进行中，综述已先行交付；报告生成后另行查看。"}}
+
+
 def _route_after_answer(state: AgentState) -> str:
     """answer 节点之后：有 content_safety 则先进安全审核再保存"""
     skills = state.get("skills", [])
@@ -2048,66 +3022,31 @@ def _route_after_answer(state: AgentState) -> str:
 
 
 def route_after_judge(state: AgentState) -> str:
-    """条件边：判断通过则走安全审核（如有）或保存，未通过则重写。
+    """条件边：评审后**直接交付**（不做多轮重写）。
 
-    增强（迭代评测）：
-      · needs_research=True（证据类缺陷占主导）→ 回 agent 重新检索（re_search）
-      · force_rounds=N（评测用）→ 即使 passed 也强制继续重写 N 轮，供 eval_iteration 采集
+    用户决策（2026-10）：重写太慢（judge 曾占总耗时 58.8%），改为单次评审，
+    综述随评审报告（含低置信内容清单与原因）一并交付，低置信点交用户审核。
+    v1.2.13：评审已异步化（async_judge_node 启动后台线程），judge 节点秒回
+    `review_score.status=pending` → 综述先行交付，报告后台生成后补交。
+    因此 judge → 永远进 save（或 content_safety，当前恒 False → 实际恒 save）。
     """
     score = state.get("review_score", {})
-    passed = bool(score.get("passed", False))
-    rewrite_count = state.get("rewrite_count", 0)
     skills = state.get("skills", [])
-    force = int(state.get("force_rounds") or 0)
-    # 重写轮数固定三轮封顶（用户要求）：评测强制轮 force 不再放大 target；
-    # EVAL_MAX_ROUNDS 环境变量可临时覆盖（评测只测一轮用 EVAL_MAX_ROUNDS=1）
-    import os as _os
-    target = int(_os.environ.get("EVAL_MAX_ROUNDS", str(MAX_REWRITE_ROUNDS)))
-
-    # ⚠️ `re_research_count` 这一项**不能省**。`judge → agent` 这条边不经过
-    #    increment_rewrite，rewrite_count 不增加，所以单靠 `rewrite_count < target`
-    #    守卫会永远成立 → judge 无限重跑（实测 judgev3c 跑了 6 次 judge 而
-    #    rewrite_count 只有 3，judge 占总耗时 58.8%）。
-    re_count = int(state.get("re_research_count") or 0)
-    if (not passed and state.get("needs_research")
-            and re_count < MAX_RE_RESEARCH and rewrite_count < target):
-        print(f"--> [Reflect] 🔬 证据类缺陷主导 → 回 agent 补检索"
-              f"（第 {re_count + 1}/{MAX_RE_RESEARCH} 次）")
-        return "agent"
-    if not passed and state.get("needs_research") and re_count >= MAX_RE_RESEARCH:
-        print(f"--> [Reflect] ⚠️ 补检索配额已用完（{re_count}/{MAX_RE_RESEARCH}）"
-              f"→ 转为就地重写（继续检索已无收益）")
-
-    if passed and force and rewrite_count < force:
-        print(f"--> [Reflect] 🔄 评测强制第 {rewrite_count + 1}/{force} 轮 → 启动第 {rewrite_count + 1}/{target} 轮重写")
-        return "increment_rewrite"
-
-    if passed:
-        if needs_content_safety(skills):
-            print("--> [Reflect] ✅ 综述通过评审 → 内容安全审核")
-            return "content_safety"
-        print("--> [Reflect] ✅ 综述通过评审 → 保存")
-        return "save"
-
-    if rewrite_count >= target:
-        dest = "content_safety" if needs_content_safety(skills) else "save"
-        print(f"--> [Reflect] ⚠️ 已达最大重写次数 → {dest}")
-        return dest
-
-    print(f"--> [Reflect] 🔄 未通过，启动第 {rewrite_count + 1}/{target} 轮重写")
-    return "increment_rewrite"
+    if str(score.get("status")) == "pending":
+        print("--> [Reflect] 🔄 评审后台进行中 → 综述先行交付（报告生成后补交）")
+    else:
+        passed = bool(score.get("passed", False))
+        if passed:
+            print("--> [Reflect] ✅ 综述通过评审 → 保存交付")
+        else:
+            print("--> [Reflect] ⚠️ 评审未通过（单次评审不重写）→ 附评审报告交付保存")
+    return "content_safety" if needs_content_safety(skills) else "save"
 
 
 def increment_re_research_node(state: AgentState):
-    """【节点 · 计数】`judge → agent` 补检索路径的配额计数。
-
-    ⚠️ 存在的唯一理由：这条边**不经过 increment_rewrite**，若不在此计数，
-    `route_after_judge` 的预算判断就形同虚设，judge 会被无限重跑。
-    见 config.MAX_RE_RESEARCH 的注释（实测 judgev3c judge 跑 6 次、占 58.8% 耗时）。
-    """
-    n = int(state.get("re_research_count") or 0) + 1
-    print(f"--> [Reflect] 🔬 补检索计数 {n}/{MAX_RE_RESEARCH}")
-    return {"re_research_count": n}
+    """【已废弃】`judge → agent` 补检索路径已删除（2026-10：单次评审直接交付，不再补检）。
+    本函数仅保留签名兼容旧引用，不再挂入图。"""
+    return {"re_research_count": int(state.get("re_research_count") or 0) + 1}
 
 
 def increment_rewrite_node(state: AgentState):
@@ -2158,12 +3097,14 @@ def content_safety_node(state: AgentState, llm):
             }
         }
 
+    # 渐进式披露 L2：审核维度/阈值/输出契约来自 content_safety/SKILL.md，不再写死在节点里
+    # ⚠️ 转义花括号：正文含 JSON 输出契约 {...}，作为 ChatPromptTemplate 模板会崩（同 judge 修复）。
+    _safety_skill = build_skill_instructions(["content_safety"]).replace("{", "{{").replace("}", "}}")
+
     system = _with_memory(
-        "你是一名内容安全审核员。请从以下 4 个维度对文本打分（各 1-10 分）：\n"
-        "1. 政治合规性——是否符合中国法律法规和社会主义核心价值观，不传播违规内容\n"
-        "2. 用语文明——是否不含侮辱/歧视/攻击性语言，不煽动对立情绪\n"
-        "3. 信息真实性——引用信息是否标注来源，不传播未经证实的谣言\n"
-        "4. 客观中立——是否保持理性客观，涉及争议时公平呈现各方观点\n\n"
+        "你是一名内容安全审核员。\n\n"
+        + (_safety_skill or "")
+        + "\n按上述技能规范执行：从 4 个维度（政治合规性/用语文明/信息真实性/客观中立）打分（各 1-10 分），"
         "以 JSON 格式输出（只输出 JSON，不要其他文字）：\n"
         '{{"政治合规性": <int>, "用语文明": <int>, "信息真实性": <int>, '
         '"客观中立": <int>, '
@@ -2297,10 +3238,12 @@ def save_node(state: AgentState):
     is_review = needs_write_review(skills) or needs_search_papers(skills)
     print(f"--> [Save] skills={skills} is_review={is_review}")
     if session_id and is_review:
+        _rr = state.get("review_report", {}) or {}
         save_conversation_turn(session_id, "assistant", final_output[:3000],
                                {"type": "final_review", "topic": topic,
                                 "score": score.get("total_score", "N/A"),
-                                "rewrites": state.get("rewrite_count", 0)})
+                                "rewrites": state.get("rewrite_count", 0),
+                                "low_confidence": len(_rr.get("low_confidence") or [])})
         # 综述摘要记忆由 run_stream 的 LLM-as-Judge 统一分类存储（L1/L2），此处不再重复写入
 
     # ---- 3. 如果用户指定了保存路径，写入文件 ----

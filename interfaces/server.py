@@ -254,48 +254,6 @@ async def chat_post(request: Request, body: ChatRequest = Body(...)):
     return EventSourceResponse(event_generator())
 
 
-@app.post("/api/review-action")
-async def review_action(request: Request):
-    """人机审核操作：用户对检索结果审核后的决策。
-
-    前端直连此接口，从 LangGraph interrupt 断点恢复图执行。
-
-    请求体 JSON:
-        thread_id: 会话 ID（必填）
-        action: "accept" | "skip" | "re_search"
-        feedback: 补充说明（re_search 时用于调整检索方向）
-
-    返回 SSE 流。
-    """
-    user_id = get_user_id(request)
-    _current_user_id.set(user_id)
-
-    body = await request.json()
-    thread_id = body.get("thread_id", "")
-    action = body.get("action", "accept")
-    feedback = body.get("feedback", "")
-
-    if not thread_id:
-        return JSONResponse({"ok": False, "reason": "缺少 thread_id"}, status_code=400)
-
-    if action not in ("accept", "skip", "re_search"):
-        return JSONResponse({"ok": False, "reason": f"无效 action: {action}"}, status_code=400)
-
-    resume_value = {"action": action, "feedback": feedback}
-
-    async def event_generator():
-        async for event in run_stream(
-            thread_id=thread_id,
-            resume_value=resume_value,
-        ):
-            if await request.is_disconnected():
-                break
-            yield {"data": json.dumps(event, ensure_ascii=False)}
-        yield {"data": json.dumps({"type": "done"}, ensure_ascii=False)}
-
-    return EventSourceResponse(event_generator())
-
-
 # ==========================================
 # 5. 对话列表 & 历史
 # ==========================================
