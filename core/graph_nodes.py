@@ -414,6 +414,12 @@ def route_after_parse(state: AgentState) -> str:
         print(f"--> [Route] 意图门拦截（malicious={_mal:.2f} researchable={_res:.2f}）→ reject")
         return "reject"
 
+    # v1.2.20 综述级缓存门：写综述请求先查「同 query+约束」是否已生成过综述，
+    # 命中 → 跳过整个检索/制卡/写作/评审流水线，直接交付（秒回）。
+    if needs_write_review(skills) or "write_review" in skills:
+        print(f"--> [Route] skills={skills} → review_gate（综述级缓存检查）")
+        return "review_gate"
+
     if needs_index_file(skills):
         print(f"--> [Route] skills={skills} → process_file")
         return "process_file"
@@ -426,6 +432,46 @@ def route_after_parse(state: AgentState) -> str:
     # 无输入类 skill：直接回答
     print(f"--> [Route] skills={skills} → simple_chat")
     return "simple_chat"
+
+
+def _review_constraint_fp(state: AgentState) -> str:
+    """综述级缓存约束指纹：用户约束（字数/结构/节数/即时约束）不同 → 产物不同，
+    不能因 query 相似就命中旧综述。取 state 中影响产物的约束字段做 hash。"""
+    import hashlib
+    parts = [
+        str(state.get("word_budget") or ""),
+        str(state.get("review_structure") or ""),
+        str(state.get("sections") or ""),
+        str(state.get("user_constraints") or ""),
+    ]
+    return hashlib.md5("|".join(parts).encode("utf-8")).hexdigest()[:16]
+
+
+def review_cache_gate_node(state: AgentState) -> dict:
+    """【节点 · 综述级缓存门】（确定性，无 LLM）
+    同 query + 同约束指纹命中 → 把缓存综述灌回 state 并路由到 save（跳过流水线）；
+    未命中 → 正常进 agent 循环。
+    （v1.2.20 曾加 query 语义相似命中，实测 bge-m3 中文短主题词的目标/误命中分布
+    完全重叠、无安全阈值 → 用户决策移除，只保留精确匹配。）"""
+    from ResearcherAgent.core import cache
+    topic = state.get("topic") or state.get("user_request") or ""
+    cfp = _review_constraint_fp(state)
+    hit = cache.review_get(topic, cfp)
+    if hit and isinstance(hit, dict) and hit.get("final_review"):
+        print(f"--> [ReviewGate] ♻️ 综述级缓存命中（topic={topic[:40]}, 约束指纹={cfp}）"
+              f"→ 直接交付，跳过检索/制卡/写作/评审")
+        upd: dict = {"review_cached": True, "__next": "save"}
+        for k in ("final_review", "draft_review", "review_outline",
+                  "review_score", "review_report", "reference_report"):
+            if k in hit:
+                upd[k] = hit[k]
+        return upd
+    return {"__next": "agent"}
+
+
+def route_after_review_gate(state: AgentState) -> str:
+    """条件边：review_gate 的出口（缓存命中 → save 直接交付；miss → agent）。"""
+    return state.get("__next", "agent")
 
 
 # ---- 简单对话路径 ----
@@ -1565,8 +1611,12 @@ def _map_to_cards(blocks: list, llm, skip_llm_fallback: bool = False,
         # 重制时命中缓存直接返回残缺卡（LLM 白跑）。旧缓存（无后缀）仍被完整路径命中。
         mode_sfx = "|kwo" if skip_llm_fallback else (
             "|pre" if isinstance(prelocated, dict) and any(prelocated.values()) else "")
-        key = f"{sec}|{title}{mode_sfx}"
-        cached = cache.llm_get("extract_passages_v6", key, text[:500])
+        # v1.2.19 键去节号：制卡是确定性过程（正则切段 + 字段query+论文标题打分，
+        # 不含大纲节上下文）→ 同一论文同一制卡路径，卡片必然一样；
+        # text[:500] 全文指纹防"不同论文同标题"串键。去 sec 后：
+        # 同一论文在不同综述/不同大纲节下制卡缓存均可命中。
+        key = f"{title}{mode_sfx}"
+        cached = cache.card_get(title, mode_sfx, text[:500])
         result = None
         if cached:
             try:
@@ -1702,8 +1752,8 @@ def _map_to_cards(blocks: list, llm, skip_llm_fallback: bool = False,
                 result = {"fields": fields, "card": card_txt,
                           "passages": passages, "extract_mode": mode}
             try:
-                cache.llm_set("extract_passages_v6", key, text[:500],
-                              json.dumps(result, ensure_ascii=False))
+                cache.card_set(title, mode_sfx, text[:500],
+                               json.dumps(result, ensure_ascii=False))
             except Exception:
                 pass
         if result.get("fields"):
@@ -3254,6 +3304,23 @@ def save_node(state: AgentState):
         sp.parent.mkdir(parents=True, exist_ok=True)
         sp.write_text(final_output, encoding="utf-8")
         print(f"--> [Save] ✅ 已按用户指定路径保存: {sp}")
+
+    # ---- 4. 综述级缓存：同 query+约束命中直接复用（v1.2.20）----
+    if is_review and final_output:
+        try:
+            from ResearcherAgent.core import cache
+            cache.review_set(topic, {
+                "final_review": final_output,
+                "draft_review": final_output,
+                "review_outline": state.get("review_outline", []),
+                "review_score": score,
+                "review_report": state.get("review_report", {}),
+                "reference_report": state.get("reference_report", {}),
+                "saved_at": __import__("time").time(),
+            }, _review_constraint_fp(state))
+            print(f"--> [Save] ♻️ 已写入综述级缓存（topic={str(topic)[:40]}, {len(final_output):,} 字, TTL 7 天）")
+        except Exception as e:
+            print(f"--> [Save] ⚠️ 综述级缓存写入失败: {str(e)[:80]}")
 
     return {
         "final_review": final_output,

@@ -238,16 +238,36 @@ def tavily_search(query: str, max_results: int = 8) -> list[dict]:
         return []
 
 
+def _ft_cache_get(key: str) -> str | None:
+    """Redis 全文缓存（v1.2.19）。返回：None=无缓存；""=缓存过失败（放弃）；
+    其他=缓存全文。命中即跳过网络下载 / CORE 配额消耗。"""
+    from ResearcherAgent.core import cache
+    text, hit = cache.fulltext_get(key)
+    return text if hit else None
+
+
+def _ft_cache_set(key: str, text: str) -> None:
+    from ResearcherAgent.core import cache
+    cache.fulltext_set(key, text)   # 空文本也缓存（__none__ 失败标记）
+
+
 def fetch_arxiv_fulltext(arxiv_id: str, max_chars: int | None = 30000, section_max: int = 6000) -> str:
     """从 ar5iv 拿 arXiv 论文的结构化全文（不下 PDF）。失败返回空串。
 
     max_chars=None → 全篇下载（方案 v1.2：抽取不吃上下文，去字符截断）。
-    v1.2.4：ar5iv / 摘要页本机通路都失败时，用 Tavily extract 抓 arxiv 页面兜底。"""
+    v1.2.4：ar5iv / 摘要页本机通路都失败时，用 Tavily extract 抓 arxiv 页面兜底。
+    v1.2.19：Redis 全文缓存（键 arxiv:<id>，TTL 30 天）——命中直接返回，不重新下载。"""
     arxiv_id = (arxiv_id or "").strip()
     arxiv_id = re.sub(r"^arxiv:", "", arxiv_id, flags=re.I)
     arxiv_id = re.sub(r"v\d+$", "", arxiv_id)  # 去版本号
     if not arxiv_id:
         return ""
+    _ckey = "arxiv:" + arxiv_id
+    _cached = _ft_cache_get(_ckey)
+    if _cached is not None:
+        if _cached:
+            print(f"    [fulltext] 缓存命中 arXiv {arxiv_id}（{len(_cached)} 字符）")
+        return _cached
     reasons = []
     for url in (
         f"https://ar5iv.labs.arxiv.org/html/{arxiv_id}",
@@ -260,6 +280,7 @@ def fetch_arxiv_fulltext(arxiv_id: str, max_chars: int | None = 30000, section_m
                 continue
             text = _extract_sections_from_html(html, max_chars, section_max=section_max)
             if len(text) > 200:
+                _ft_cache_set(_ckey, text)
                 return text
             reasons.append(f"{url} → 正文过短({len(text)}字符，可能是跳转/错误页)")
         except Exception as e:
@@ -268,35 +289,51 @@ def fetch_arxiv_fulltext(arxiv_id: str, max_chars: int | None = 30000, section_m
     # v1.2.4 Tavily 兜底：本机 ar5iv/摘要页通路失败时，用 Tavily extract 抓 arxiv 页面
     t = _tavily_extract(f"https://arxiv.org/abs/{arxiv_id}")
     if t and len(t) > 200:
-        return t if max_chars is None else t[:max_chars]
+        t = t if max_chars is None else t[:max_chars]
+        _ft_cache_set(_ckey, t)
+        return t
     if t:
         reasons.append(f"tavily → 正文过短({len(t)}字符)")
     print(f"    [fulltext] arXiv {arxiv_id} 取全文失败：{' | '.join(reasons)}")
+    _ft_cache_set(_ckey, "")   # 失败也缓存（30 天内不反复重试）
     return ""
 
 
 def fetch_pmc_fulltext(pmcid: str, max_chars: int | None = 30000) -> str:
     """从 Europe PMC 拿开放获取论文的 JATS 全文（不下 PDF）。失败返回空串。
 
-    max_chars=None → 全篇下载。"""
+    max_chars=None → 全篇下载。
+    v1.2.19：Redis 全文缓存（键 pmc:<PMCID>，TTL 30 天）。"""
     pmcid = (pmcid or "").strip().upper()
     if not pmcid.startswith("PMC"):
         return ""
+    _ckey = "pmc:" + pmcid
+    _cached = _ft_cache_get(_ckey)
+    if _cached is not None:
+        if _cached:
+            print(f"    [fulltext] 缓存命中 Europe PMC {pmcid}（{len(_cached)} 字符）")
+        return _cached
     url = f"https://www.ebi.ac.uk/europepmc/webservices/rest/{pmcid}/fullTextXML"
     try:
         xml = _http_get(url)
         if not xml:
             print(f"    [fulltext] Europe PMC {pmcid} 空响应")
+            _ft_cache_set(_ckey, "")
             return ""
         text = _strip_tags(xml)
-        return text if max_chars is None else text[:max_chars]
+        text = text if max_chars is None else text[:max_chars]
+        if text:
+            _ft_cache_set(_ckey, text)
+        return text
     except urllib.error.HTTPError as e:
         # 404 = 该文献非开放获取（正常情况，不是故障），其余码才是异常
         tag = "非开放获取" if e.code == 404 else f"HTTP {e.code} {e.reason}"
         print(f"    [fulltext] Europe PMC {pmcid}: {tag}")
+        _ft_cache_set(_ckey, "")
         return ""
     except Exception as e:
         print(f"    [fulltext] Europe PMC {pmcid} 失败: {type(e).__name__}: {str(e)[:120]}")
+        _ft_cache_set(_ckey, "")
         return ""
 
 if __name__ == "__main__":
@@ -360,6 +397,14 @@ def fetch_core_fulltext(doi: str = "", title: str = "", core_id: str = "") -> st
         ident = (title or "").strip()
     if not ident:
         return ""
+    # v1.2.19 Redis 全文缓存（键 core:<ident>，TTL 30 天）：命中即不再烧 CORE 配额。
+    # 磁盘缓存（FULLTEXT_CACHE_DIR）仍保留——Redis 是跨会话/跨进程的统一层。
+    _ckey = "core:" + ident
+    _cached = _ft_cache_get(_ckey)
+    if _cached is not None:
+        if _cached:
+            print(f"    [fulltext] 缓存命中 CORE {ident[:50]}（{len(_cached)} 字符）")
+        return _cached
     # 磁盘缓存：同 DOI 只调一次 CORE（个人配额 1000 tokens/天 有限）
     cache_dir = os.environ.get("FULLTEXT_CACHE_DIR") or ""
     cf = ""
@@ -398,6 +443,7 @@ def fetch_core_fulltext(doi: str = "", title: str = "", core_id: str = "") -> st
             if not arts:
                 print(f"    [fulltext] CORE 未收录: {ident[:60]}")
                 _core_cache_write(cf, "")
+                _ft_cache_set(_ckey, "")
                 return ""
             ids = [str(a.get("id") or "") for a in arts if a.get("id")]
         # ── v3 全文：works/{id} 的 fullText 字段直接是全文文本 ──
@@ -414,6 +460,7 @@ def fetch_core_fulltext(doi: str = "", title: str = "", core_id: str = "") -> st
                 t = _strip_tags(str(d2.get("fullText") or ""))
                 if len(t) >= 300:
                     _core_cache_write(cf, t)
+                    _ft_cache_set(_ckey, t)
                     return t
                 last_err = f"全文过短({len(t)}字符)"
             except Exception as e:
@@ -421,6 +468,7 @@ def fetch_core_fulltext(doi: str = "", title: str = "", core_id: str = "") -> st
                 continue
         print(f"    [fulltext] CORE 全文不可得 {ident[:60]}: {last_err}")
         _core_cache_write(cf, "")
+        _ft_cache_set(_ckey, "")
         return ""
     except Exception as e:
         print(f"    [fulltext] CORE 失败 {ident[:60]}: {type(e).__name__}: {str(e)[:80]}")
@@ -484,11 +532,19 @@ def fetch_oa_fulltext(url: str, max_chars: int | None = 30000, section_max: int 
     url = (url or "").strip()
     if not url.startswith("http"):
         return ""
+    # v1.2.19 Redis 全文缓存（键 oa:<url>）：命中即跳过整个通路链（含 CORE/PDF/Tavily）
+    _ckey = "oa:" + url
+    _cached = _ft_cache_get(_ckey)
+    if _cached is not None:
+        if _cached:
+            print(f"    [fulltext] 缓存命中 OA {url[:70]}（{len(_cached)} 字符）")
+        return _cached
     # 1) arXiv 链接 → ar5iv
     m = re.search(r"arxiv\.org/(?:abs|pdf)/(\d{4}\.\d{4,5})", url, re.I)
     if m:
         t = fetch_arxiv_fulltext(m.group(1), max_chars, section_max=section_max)
         if t:
+            _ft_cache_set(_ckey, t)
             return t
     # 2) core.ac.uk/download/<id> → CORE API works/{id}（v1.2.9 方案 A：
     #    前端 PDF 端点几乎必 403，直接按 work id 取 fullText，不碰反爬）
@@ -518,6 +574,9 @@ def fetch_oa_fulltext(url: str, max_chars: int | None = 30000, section_max: int 
     # 5) Tavily extract（绕本机网络限制；对 PDF 直链返回全文文本）
     t = _tavily_extract(url)
     if t and len(t) > 300:
-        return t if max_chars is None else t[:max_chars]
+        t = t if max_chars is None else t[:max_chars]
+        _ft_cache_set(_ckey, t)
+        return t
     print(f"    [fulltext] OA 全文不可得: {url[:80]}")
+    _ft_cache_set(_ckey, "")
     return ""

@@ -53,6 +53,8 @@ from ResearcherAgent.core.graph_nodes import (
     route_after_content_safety,
     route_after_increment_content_safety,
     _route_after_answer,
+    review_cache_gate_node,
+    route_after_review_gate,
 )
 
 
@@ -323,6 +325,7 @@ class AgentRuntime:
         workflow.add_node("save", save_node)
         workflow.add_node("process_file", _proc_file, retry_policy=LLM_RETRY)
         workflow.add_node("file_qa", _file_qa, retry_policy=LLM_RETRY)
+        workflow.add_node("review_gate", review_cache_gate_node)
 
         workflow.set_entry_point("parse")
         workflow.add_conditional_edges("parse", route_after_parse, {
@@ -330,6 +333,11 @@ class AgentRuntime:
             "agent": "agent",
             "process_file": "process_file",
             "reject": "reject",
+            "review_gate": "review_gate",
+        })
+        # v1.2.20 综述级缓存门：命中 → save 直接交付；miss → agent 正常流水线
+        workflow.add_conditional_edges("review_gate", route_after_review_gate, {
+            "agent": "agent", "save": "save",
         })
 
         # 文件路径

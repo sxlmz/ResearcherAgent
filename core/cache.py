@@ -60,6 +60,15 @@ DB = int(os.environ.get("CACHE_REDIS_DB", "1"))     # 默认 DB1，与同一 Red
 TTL = int(os.environ.get("CACHE_TTL", str(24 * 3600)))
 ENABLED = os.environ.get("CACHE_ENABLED", "1") not in ("0", "false", "False")
 
+# v1.2.19-20 三大块缓存 TTL 分级：
+#   综述级 review   综述全文 7 天（内容随论文更新，不宜过长）
+#   论文级 paper   全文 / 制卡 / 提取块 30 天（论文内容固定，跨主题复用）
+#   计算级         检索 24h（SQLite 7 天持久兜底）/ 选材 24h
+FULLTEXT_TTL = int(os.environ.get("CACHE_FULLTEXT_TTL", str(30 * 24 * 3600)))
+BLOCKS_TTL = int(os.environ.get("CACHE_BLOCKS_TTL", str(30 * 24 * 3600)))
+REVIEW_TTL = int(os.environ.get("CACHE_REVIEW_TTL", str(7 * 24 * 3600)))
+_NONE_MARK = "__none__"      # 全文"下载失败/未收录"标记：缓存失败结果，避免反复重试烧配额
+
 _lock = threading.Lock()
 
 
@@ -97,8 +106,14 @@ class _Cache:
     def __init__(self):
         self._backend = None
         self._name = "off"
+        # v1.2.20 三大块缓存统计：
+        #   review = 综述级（综述全文 rev: / 演进方向 rev:evo: / 大纲 rev:ol:）
+        #   paper  = 论文级（全文 pp:ft: / 字段化制卡 pp:card: / 提取块 pp:blk:）
+        #   search = 计算级·检索（src:，三层：内存→SQLite→Redis）
+        #   select = 计算级·选材（sel:，含全池重排，重排缓存已并入本层）
+        #   embed  = 记忆链路 Embedding（emb:，与综述三大块无关）
         self.stats = {k: {"hit": 0, "miss": 0}
-                      for k in ("llm", "embed", "search", "rerank", "select")}
+                      for k in ("review", "paper", "search", "select", "embed")}
         self._connect()
 
     def _connect(self):
@@ -150,18 +165,21 @@ class _Cache:
     def _bump(self, layer, hit):
         self.stats[layer]["hit" if hit else "miss"] += 1
 
-    # ── L1 · LLM ─────────────────────────────────────────
-    def llm_get(self, model, system, user, extra=""):
+    # ── 论文级 · 字段化制卡（v1.2.20：原 llm: 层改名归并。键含制卡路径，
+    #    全文指纹防「不同论文同标题」串键；不含大纲节——制卡是确定性过程，
+    #    同一论文同一路径卡片必然一样，跨综述/跨节可命中）────────────────
+    def card_get(self, title: str, mode_sfx: str, text_head: str):
         if not ENABLED:
             return None
-        v = self._get("llm:" + _h(model, system, user, extra))
-        self._bump("llm", bool(v))
+        v = self._get("pp:card:" + _h("extract_passages_v6", f"{title}{mode_sfx}", text_head))
+        self._bump("paper", bool(v))
         return v
 
-    def llm_set(self, model, system, user, value, extra=""):
-        self._set("llm:" + _h(model, system, user, extra), value)
+    def card_set(self, title: str, mode_sfx: str, text_head: str, value):
+        self._set("pp:card:" + _h("extract_passages_v6", f"{title}{mode_sfx}", text_head),
+                  value, ttl=FULLTEXT_TTL)
 
-    # ── L2 · Embedding ───────────────────────────────────
+    # ── 记忆链路 · Embedding ──────────────────────────────
     def embed_get(self, model, text):
         if not ENABLED:
             return None
@@ -235,6 +253,93 @@ class _Cache:
         self._set("sel:" + _h(pool_fp, outline_fp),
                   json.dumps(payload, ensure_ascii=False))
 
+    # ── L6 · 论文全文缓存（v1.2.19：命中率最高的缓存点）────────────────
+    def fulltext_get(self, paper_key: str) -> tuple:
+        """按论文标识取全文。返回 (text, hit)：
+        hit=False → 无缓存，应下载；hit=True → text 即全文（"" 表示该论文
+        此前已确认取不到全文，直接放弃，避免反复重试烧外部配额）。"""
+        if not ENABLED:
+            return (None, False)
+        v = self._get("pp:ft:" + _h("ft", str(paper_key).strip().lower()))
+        if v is None:
+            self._bump("paper", False)
+            return (None, False)
+        self._bump("paper", True)
+        return ("", True) if v == _NONE_MARK else (v, True)
+
+    def fulltext_set(self, paper_key: str, text: str):
+        self._set("pp:ft:" + _h("ft", str(paper_key).strip().lower()),
+                  text if text else _NONE_MARK, ttl=FULLTEXT_TTL)
+
+    # ── 论文级 · LLM 提取块缓存（v1.2.19：同卡片只调一次 LLM）──────────
+    def blocks_get(self, card: dict):
+        """按卡片稳定字段（title+id+fields）查提取块；无缓存返回 None。
+        键不含 num/section 等易变字段——同一篇论文在不同综述里节/编号不同
+        仍可命中（提取结果只依赖原文内容）。"""
+        if not ENABLED:
+            return None
+        key = _h("blk", json.dumps({
+            "title": (card or {}).get("title", ""),
+            "id": (card or {}).get("id", ""),
+            "fields": (card or {}).get("fields") or {},
+        }, ensure_ascii=False, sort_keys=True))
+        v = self._get("pp:blk:" + key)
+        self._bump("paper", bool(v))
+        if v is None:
+            return None
+        try:
+            return json.loads(v)
+        except Exception:
+            return None
+
+    def blocks_set(self, card: dict, blocks: list):
+        if not blocks:
+            return
+        key = _h("blk", json.dumps({
+            "title": (card or {}).get("title", ""),
+            "id": (card or {}).get("id", ""),
+            "fields": (card or {}).get("fields") or {},
+        }, ensure_ascii=False, sort_keys=True))
+        self._set("pp:blk:" + key, json.dumps(blocks, ensure_ascii=False), ttl=BLOCKS_TTL)
+
+    # ── 综述级 · 综述全文缓存（v1.2.20：query 命中直接返回整篇综述）────
+    # 键 = 归一化 query + 用户约束指纹（字数/节数/指定大纲/领域——约束不同产物不同，
+    #     不能因 query 相似就命中）；可选 embedding 余弦阈值命中同义 query。
+    @staticmethod
+    def _query_key(topic: str) -> str:
+        return " ".join(str(topic).split()).strip().lower()[:200]
+
+    def review_get(self, topic: str, constraint_fp: str = ""):
+        if not ENABLED:
+            return None
+        v = self._get("rev:" + self._query_key(topic) + ":"
+                      + _h("fp", constraint_fp))
+        self._bump("review", bool(v))
+        try:
+            return json.loads(v) if v else None
+        except Exception:
+            return None
+
+    def review_set(self, topic: str, payload: dict, constraint_fp: str = ""):
+        self._set("rev:" + self._query_key(topic) + ":"
+                  + _h("fp", constraint_fp),
+                  json.dumps(payload, ensure_ascii=False), ttl=REVIEW_TTL)
+
+    def review_flush_topic(self, topic: str):
+        """清掉某主题的全部综述级缓存（含约束变体）——用户改了约束后重跑，
+        不能命中旧综述。返回清理条数。"""
+        if not self._backend:
+            return 0
+        qk = self._query_key(topic)
+        prefix = PREFIX + "rev:" + qk + ":"
+        try:
+            ks = list(self._backend.keys(prefix + "*"))
+            for k in ks:
+                self._backend.delete(k)
+            return len(ks)
+        except Exception:
+            return 0
+
     # ── 运维 ─────────────────────────────────────────────
     def summary(self) -> dict:
         out = {"backend": self._name, "db": DB if self._name == "redis" else None}
@@ -267,18 +372,23 @@ class _Cache:
 cache = _Cache()
 
 # ── 模块级委托 ──
-# 让调用点写 `cache.llm_get(...)` 而不是 `cache.cache.llm_get(...)`——
-# 否则 `import cache` 拿到的是模块、方法却在单例上，很容易写成 cache.rerank_mget 而报错。
-llm_get = cache.llm_get
-llm_set = cache.llm_set
+# 让调用点写 `cache.xxx(...)` 而不是 `cache.cache.xxx(...)`——
+# 否则 `import cache` 拿到的是模块、方法却在单例上，很容易写成 cache.xxx 而报错。
+card_get = cache.card_get
+card_set = cache.card_set
 embed_get = cache.embed_get
 embed_set = cache.embed_set
 search_get = cache.search_get
 search_set = cache.search_set
-rerank_mget = cache.rerank_mget
-rerank_mset = cache.rerank_mset
 select_get = cache.select_get
 select_set = cache.select_set
+fulltext_get = cache.fulltext_get
+fulltext_set = cache.fulltext_set
+blocks_get = cache.blocks_get
+blocks_set = cache.blocks_set
+review_get = cache.review_get
+review_set = cache.review_set
+review_flush_topic = cache.review_flush_topic
 summary = cache.summary
 reset_stats = cache.reset_stats
 flush = cache.flush

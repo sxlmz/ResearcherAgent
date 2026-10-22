@@ -112,29 +112,16 @@ def rerank(query: str, documents: list[str], top_n: int | None = None,
 
     with tracing.span("tool", "rerank", thread_id, n_docs=len(documents),
                       query=query[:60]) as sp:
-        # ---- ① 批量查缓存 ----
-        scores: list[float | None] = list(cache.rerank_mget(model, query, documents))
-        miss = [i for i, s in enumerate(scores) if s is None]
-        n_hit = len(documents) - len(miss)
-        if n_hit:
-            sp["cache_hit"] = n_hit
-            print(f"    ♻️ [rerank] L4 缓存命中 {n_hit}/{len(documents)} 篇")
-
-        # ---- ② 只对未命中的文档调 API ----
-        if miss:
-            miss_docs = [documents[i] for i in miss]
-            got = _call_api(query, miss_docs, sp)
-            if got is None:
-                if n_hit == 0:
-                    sp["error"] = "api_failed"
-                    return None
-                # 有部分缓存但 API 挂了：不返回半份排名（缺的那批论文会静默消失），
-                # 交给调用方整体降级
-                sp["error"] = "api_failed_partial"
-                return None
-            for k, i in enumerate(miss):
-                scores[i] = got[k]
-            cache.rerank_mset(model, query, miss_docs, got)
+        # ---- v1.2.20 重排分数不再单独缓存 ----
+        # 理由：选材缓存（sel:，粒度为「池+大纲 → 每节 top-K 候选」）已整体覆盖
+        # 重排结果——同池同大纲重跑时 select 命中直接跳过全部重排；换池/换大纲时
+        # 各节 query 随大纲 focus 变化，细粒度重排分数基本也 miss，缓存价值趋近于零。
+        # 重排分数由选材缓存放行，本函数只做实时打分（打分是确定性计算，无外部配额）。
+        got = _call_api(query, documents, sp)
+        if got is None:
+            sp["error"] = "api_failed"
+            return None
+        scores = got
 
         out = [(i, float(s)) for i, s in enumerate(scores) if s is not None]
         if not out:

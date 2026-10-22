@@ -109,6 +109,15 @@ def generate_json_blocks_for_card(card: dict, llm, outline: list | None = None) 
     import re
     from langchain_core.prompts import ChatPromptTemplate
 
+    # v1.2.19 提取块缓存：同一张卡片（论文+字段）只调一次 LLM。
+    # 命中直接返回（键 = title+id+fields，不含 num/section——同一篇论文在
+    # 不同综述里节/编号不同仍可复用提取结果）。
+    from ResearcherAgent.core import cache
+    _cached = cache.blocks_get(card)
+    if _cached is not None:
+        print(f"    [card_to_json] 缓存命中提取块 {card.get('id','')[:24]}（{len(_cached)} 块，跳过 LLM）")
+        return _cached
+
     fields = (card or {}).get("fields") or {}
     card_json = json.dumps({
         "title": (card or {}).get("title", ""),
@@ -159,6 +168,8 @@ def generate_json_blocks_for_card(card: dict, llm, outline: list | None = None) 
             break
         total += len(c)
         kept.append(b)
+    if kept:
+        cache.blocks_set(card, kept)   # v1.2.19 写提取块缓存（30 天）
     return kept
 
 
